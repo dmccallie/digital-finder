@@ -5,6 +5,7 @@ from digital_finder.models import CalibrationStar
 
 # Bright stars with decent seasonal spread; eastern options are noted to prefer pre-meridian alignment.
 SAMPLE_CALIBRATION_STARS: list[CalibrationStar] = [
+    CalibrationStar(name="HD 46223", ra_deg=98.041667, dec_deg=5.005833, notes="Rosette central star test target"),
     CalibrationStar(name="Sirius", ra_deg=101.287155, dec_deg=-16.716116, notes="Winter, bright south"),
     CalibrationStar(name="Arcturus", ra_deg=213.915300, dec_deg=19.182409, notes="Spring, often east/south-east"),
     CalibrationStar(name="Vega", ra_deg=279.234734, dec_deg=38.783688, notes="Summer, high east in evening"),

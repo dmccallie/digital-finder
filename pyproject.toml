@@ -11,6 +11,7 @@ dependencies = [
 	"platformdirs>=4.3.0",
 	"pyside6>=6.8.0",
 	"pyzwoasi>=0.2.6",
+	"tzdata>=2025.2",
 ]
 
 [project.scripts]

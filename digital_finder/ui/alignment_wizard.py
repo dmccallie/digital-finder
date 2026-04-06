@@ -5,7 +5,17 @@ import logging
 from PySide6 import QtCore, QtWidgets
 
 from digital_finder.config import TIMEOUTS
-from digital_finder.models import CalibrationRecord, Coordinates, Frame, SolveResult, now_utc_iso, wrap_ra_deg
+from digital_finder.models import (
+    CalibrationRecord,
+    Coordinates,
+    Frame,
+    SolveResult,
+    format_plate_solve_metrics,
+    format_dec_deg_with_dms,
+    format_ra_deg_with_hms,
+    now_utc_iso,
+    wrap_ra_deg,
+)
 from digital_finder.services.interfaces import PlateSolver, TelescopeClient
 from digital_finder.stars import SAMPLE_CALIBRATION_STARS
 
@@ -38,7 +48,13 @@ class AlignmentWizardDialog(QtWidgets.QDialog):
         self._star_combo = QtWidgets.QComboBox()
         self._star_combo.addItem("Select star...")
         for star in SAMPLE_CALIBRATION_STARS:
-            self._star_combo.addItem(f"{star.name} (RA {star.ra_deg:.3f}, Dec {star.dec_deg:.3f})", star)
+            self._star_combo.addItem(
+                f"{star.name} ("
+                f"RA {format_ra_deg_with_hms(star.ra_deg, precision=3)}, "
+                f"Dec {format_dec_deg_with_dms(star.dec_deg, precision=3)}"
+                f")",
+                star,
+            )
 
         self._slew_btn = QtWidgets.QPushButton("Slew Scope to Star")
         self._slew_btn.setEnabled(False)
@@ -129,22 +145,61 @@ class AlignmentWizardDialog(QtWidgets.QDialog):
         if star is None:
             return
 
-        try:
-            mount = self._telescope.get_coordinates(timeout_s=TIMEOUTS.telescope_command_s)
-            frame: Frame = self._frame_provider()
-            solve: SolveResult = self._solver.solve(frame, timeout_s=TIMEOUTS.plate_solve_s)
-        except Exception as exc:  # noqa: BLE001
-            QtWidgets.QMessageBox.critical(self, "Alignment Failed", str(exc))
-            logger.exception("Alignment action failed")
-            return
+        self._status.setText("Step 4: Settle, then Plate Solve...")
+        self._aligned_btn.setEnabled(False)
+        QtWidgets.QApplication.processEvents(QtCore.QEventLoop.ProcessEventsFlag.AllEvents, 50)
 
-        if not solve.success or solve.coordinates is None:
-            QtWidgets.QMessageBox.warning(self, "Plate Solve Failed", solve.message or "Unknown solver error")
-            return
+        while True:
+            try:
+                if self._telescope.is_slewing():
+                    raise RuntimeError("Telescope is moving. Wait for motion to stop before solving.")
 
-        finder = solve.coordinates
+                mount = self._telescope.get_coordinates(timeout_s=TIMEOUTS.telescope_command_s)
+                frame: Frame = self._frame_provider()
+                if self._telescope.is_slewing():
+                    raise RuntimeError("Telescope moved during capture. Please try again.")
+
+                solve: SolveResult = self._solver.solve(frame, timeout_s=TIMEOUTS.plate_solve_s)
+            except Exception as exc:  # noqa: BLE001
+                logger.exception("Alignment action failed")
+                action = QtWidgets.QMessageBox.question(
+                    self,
+                    "Alignment Solve Error",
+                    f"{exc}\n\nTry another image?",
+                    QtWidgets.QMessageBox.StandardButton.Retry | QtWidgets.QMessageBox.StandardButton.Cancel,
+                    QtWidgets.QMessageBox.StandardButton.Retry,
+                )
+                if action == QtWidgets.QMessageBox.StandardButton.Retry:
+                    self._status.setText("Step 4: Settle, then Plate Solve...")
+                    continue
+                self._aligned_btn.setEnabled(True)
+                return
+
+            if not solve.success or solve.coordinates is None:
+                action = QtWidgets.QMessageBox.question(
+                    self,
+                    "Plate Solve Failed",
+                    f"{solve.message or 'Unknown solver error'}\n\nTry another image?",
+                    QtWidgets.QMessageBox.StandardButton.Retry | QtWidgets.QMessageBox.StandardButton.Cancel,
+                    QtWidgets.QMessageBox.StandardButton.Retry,
+                )
+                if action == QtWidgets.QMessageBox.StandardButton.Retry:
+                    self._status.setText("Step 4: Plate solving...")
+                    continue
+                self._aligned_btn.setEnabled(True)
+                return
+
+            finder = solve.coordinates
+            break
+
         offset_ra = wrap_ra_deg(mount.ra_deg - finder.ra_deg)
         offset_dec = mount.dec_deg - finder.dec_deg
+
+        # Solve-to-star deltas are useful for alignment diagnostics.
+        solved_minus_star_ra = wrap_ra_deg(finder.ra_deg - star.ra_deg)
+        if solved_minus_star_ra > 180.0:
+            solved_minus_star_ra -= 360.0
+        solved_minus_star_dec = finder.dec_deg - star.dec_deg
 
         record = CalibrationRecord(
             timestamp_utc=now_utc_iso(),
@@ -169,9 +224,20 @@ class AlignmentWizardDialog(QtWidgets.QDialog):
             record.solve_confidence,
         )
 
+        metrics_text = format_plate_solve_metrics(solve.metrics)
+        metrics_block = f"\n\n{metrics_text}" if metrics_text else ""
+
         QtWidgets.QMessageBox.information(
             self,
             "Alignment Saved",
-            f"Offset saved:\nRA offset: {offset_ra:.5f} deg\nDec offset: {offset_dec:.5f} deg",
+            "Alignment solve successful.\n\n"
+            f"Solved coordinates:\n"
+            f"RA {format_ra_deg_with_hms(finder.ra_deg, precision=6)}\n"
+            f"Dec {format_dec_deg_with_dms(finder.dec_deg, precision=6)}\n\n"
+            f"Solved minus star ({star.name}):\n"
+            f"dRA {solved_minus_star_ra:.6f}°\n"
+            f"dDec {solved_minus_star_dec:.6f}°\n\n"
+            f"Calibration offset saved:\nRA offset: {offset_ra:.5f}°\nDec offset: {offset_dec:.5f}°"
+            f"{metrics_block}",
         )
         self.accept()

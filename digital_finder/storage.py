@@ -17,6 +17,7 @@ class CalibrationStore:
         data_dir = Path(user_data_dir(APP_NAME, APP_AUTHOR))
         data_dir.mkdir(parents=True, exist_ok=True)
         self._path = data_dir / "calibration.json"
+        print(f"Calibration store initialized at {self._path}")
 
     @property
     def path(self) -> Path:
