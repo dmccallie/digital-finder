@@ -164,7 +164,7 @@ class AlignmentWizardDialog(QtWidgets.QDialog):
                 logger.exception("Alignment action failed")
                 action = QtWidgets.QMessageBox.question(
                     self,
-                    "Alignment Solve Error",
+                    "Calibration Solve Error",
                     f"{exc}\n\nTry another image?",
                     QtWidgets.QMessageBox.StandardButton.Retry | QtWidgets.QMessageBox.StandardButton.Cancel,
                     QtWidgets.QMessageBox.StandardButton.Retry,
@@ -229,8 +229,8 @@ class AlignmentWizardDialog(QtWidgets.QDialog):
 
         QtWidgets.QMessageBox.information(
             self,
-            "Alignment Saved",
-            "Alignment solve successful.\n\n"
+            "Calibration Saved",
+            "Finder Calibration solve successful.\n\n"
             f"Solved coordinates:\n"
             f"RA {format_ra_deg_with_hms(finder.ra_deg, precision=6)}\n"
             f"Dec {format_dec_deg_with_dms(finder.dec_deg, precision=6)}\n\n"

@@ -71,6 +71,7 @@ class PersistentSettings:
     astap_downsize_factor: int = 1
     reconnect_interval_s: int = 5
     logging_level: str = "INFO"
+    image_stretch_level: int = 50
     app_window_width: int = 1100
     app_window_height: int = 720
 
@@ -91,8 +92,9 @@ class PersistentSettings:
             app_epoch=str(data.get("app_epoch", DEFAULT_EPOCH)),
             astap_executable=str(data.get("astap_executable", SOLVER_CONFIG.astap_executable)),
             astap_downsize_factor=max(1, int(data.get("astap_downsize_factor", 1))),
-            reconnect_interval_s=max(2, int(data.get("reconnect_interval_s", 5))),
+            reconnect_interval_s=max(5, int(data.get("reconnect_interval_s", 5))),
             logging_level=str(data.get("logging_level", "INFO")).upper(),
+            image_stretch_level=min(100, max(0, int(data.get("image_stretch_level", 50)))),
             app_window_width=max(800, int(data.get("app_window_width", 1100))),
             app_window_height=max(600, int(data.get("app_window_height", 720))),
         )
@@ -114,6 +116,7 @@ class PersistentSettings:
             "astap_downsize_factor": self.astap_downsize_factor,
             "reconnect_interval_s": self.reconnect_interval_s,
             "logging_level": self.logging_level,
+            "image_stretch_level": self.image_stretch_level,
             "app_window_width": self.app_window_width,
             "app_window_height": self.app_window_height,
         }
@@ -135,6 +138,46 @@ class _CaptureWorker(QtCore.QObject):
             self.frame_ready.emit(frame)
         except Exception as exc:  # noqa: BLE001
             self.error.emit(str(exc))
+        finally:
+            self.finished.emit()
+
+
+class _TelescopeConnectWorker(QtCore.QObject):
+    connected = QtCore.Signal(object, str)
+    failed = QtCore.Signal(str, str)
+    finished = QtCore.Signal()
+
+    def __init__(
+        self,
+        endpoint_text: str,
+        host: str,
+        port: int,
+        device: int,
+        epoch: str,
+        timeout_s: float,
+    ) -> None:
+        super().__init__()
+        self._endpoint_text = endpoint_text
+        self._host = host
+        self._port = port
+        self._device = device
+        self._epoch = epoch
+        self._timeout_s = timeout_s
+
+    @QtCore.Slot()
+    def run(self) -> None:
+        try:
+            scope = AlpacaTelescopeClient(
+                host=self._host,
+                port=self._port,
+                device_number=self._device,
+                epoch=self._epoch,
+                connect_timeout_s=self._timeout_s,
+            )
+            scope.connect(timeout_s=self._timeout_s)
+            self.connected.emit(scope, self._endpoint_text)
+        except Exception as exc:  # noqa: BLE001
+            self.failed.emit(str(exc), self._endpoint_text)
         finally:
             self.finished.emit()
 
@@ -414,7 +457,7 @@ class AppSettingsDialog(QtWidgets.QDialog):
         self._astap_downsize.setRange(1, 8)
         self._astap_downsize.setValue(max(1, settings.astap_downsize_factor))
         self._reconnect = QtWidgets.QSpinBox()
-        self._reconnect.setRange(2, 30)
+        self._reconnect.setRange(5, 30)
         self._reconnect.setSuffix(" s")
         self._reconnect.setValue(settings.reconnect_interval_s)
 
@@ -465,7 +508,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._settings = self._load_settings()
         self._epoch = self._settings.app_epoch
         self._apply_logging_level(self._settings.logging_level)
-        self.resize(self._settings.app_window_width, self._settings.app_window_height)
+        self._apply_initial_window_size()
 
         self._store = CalibrationStore()
         self._latest_calibration = self._store.load_latest()
@@ -487,6 +530,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self._capture_thread: QtCore.QThread | None = None
         self._capture_worker: _CaptureWorker | None = None
         self._capture_in_progress = False
+        self._telescope_connect_thread: QtCore.QThread | None = None
+        self._telescope_connect_worker: _TelescopeConnectWorker | None = None
+        self._telescope_connect_in_progress = False
 
         self._sample_image_path = self._resolve_sample_image_path(SOLVER_CONFIG.astap_test_image)
 
@@ -525,6 +571,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self._telescope_status = QtWidgets.QLabel("Telescope: Not connected")
         self._camera_status = QtWidgets.QLabel("Camera: Not connected")
         self._calibration_status = QtWidgets.QLabel("Finder Calibration: Not calibrated")
+        self._telescope_status.setWordWrap(True)
+        self._camera_status.setWordWrap(True)
+        self._calibration_status.setWordWrap(True)
         status_layout.addWidget(self._telescope_status)
         status_layout.addWidget(self._camera_status)
         status_layout.addWidget(self._calibration_status)
@@ -562,10 +611,24 @@ class MainWindow(QtWidgets.QMainWindow):
         self._image_stats_label.setSizePolicy(QtWidgets.QSizePolicy.Policy.Expanding, QtWidgets.QSizePolicy.Policy.Fixed)
         self._image_stats_label.setMinimumHeight(22)
         self._image_stats_label.setMaximumHeight(22)
+        stretch_row = QtWidgets.QHBoxLayout()
+        self._stretch_label = QtWidgets.QLabel("Stretch: 50")
+        self._stretch_label.setMinimumWidth(92)
+        self._stretch_slider = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
+        self._stretch_slider.setRange(0, 100)
+        self._stretch_slider.setSingleStep(1)
+        self._stretch_slider.setPageStep(5)
+        self._stretch_slider.setValue(self._settings.image_stretch_level)
+        self._stretch_slider.setToolTip("Adjust display stretch for the latest finder image.")
+        self._stretch_slider.valueChanged.connect(self._on_stretch_changed)
+        stretch_row.addWidget(self._stretch_label)
+        stretch_row.addWidget(self._stretch_slider, 1)
         image_layout.addWidget(self._image_label)
         image_layout.addWidget(self._image_stats_label)
+        image_layout.addLayout(stretch_row)
         image_layout.setStretch(0, 1)
         image_layout.setStretch(1, 0)
+        image_layout.setStretch(2, 0)
 
         body = QtWidgets.QHBoxLayout()
         body.addWidget(left_panel, 0)
@@ -625,8 +688,30 @@ class MainWindow(QtWidgets.QMainWindow):
                 history.append(key)
         return history
 
+    def _apply_initial_window_size(self) -> None:
+        width = max(800, int(self._settings.app_window_width))
+        height = max(600, int(self._settings.app_window_height))
+
+        screen = QtGui.QGuiApplication.primaryScreen()
+        if screen is not None:
+            available = screen.availableGeometry()
+            width = min(width, max(800, available.width()))
+            height = min(height, max(600, available.height()))
+
+        self._settings.app_window_width = width
+        self._settings.app_window_height = height
+        self.resize(width, height)
+
+    def _short_error(self, message: str | None, max_len: int = 140) -> str:
+        if not message:
+            return ""
+        compact = " ".join(str(message).split())
+        if len(compact) <= max_len:
+            return compact
+        return f"{compact[: max_len - 3]}..."
+
     def _apply_retry_interval(self) -> None:
-        interval_ms = int(max(2, self._settings.reconnect_interval_s) * 1000)
+        interval_ms = int(max(5, self._settings.reconnect_interval_s) * 1000)
         self._telescope_retry_timer.setInterval(interval_ms)
         self._camera_retry_timer.setInterval(interval_ms)
 
@@ -722,25 +807,57 @@ class MainWindow(QtWidgets.QMainWindow):
             except Exception:
                 self._telescope = None
 
-        host, port, device = endpoint
-        try:
-            scope = AlpacaTelescopeClient(
-                host=host,
-                port=port,
-                device_number=device,
-                epoch=self._epoch,
-                connect_timeout_s=TIMEOUTS.telescope_connect_s,
-            )
-            scope.connect(timeout_s=TIMEOUTS.telescope_connect_s)
-        except Exception as exc:  # noqa: BLE001
-            self._telescope_last_error = str(exc)
-            self._telescope = None
-            logger.warning("Telescope connect failed (%s): %s", self._selected_telescope_name(), exc)
+        if self._telescope_connect_in_progress:
             return
 
-        self._telescope = scope
+        host, port, device = endpoint
+        endpoint_text = f"{host}:{port}:{device}"
+
+        self._telescope_connect_in_progress = True
+        self._telescope_connect_thread = QtCore.QThread(self)
+        self._telescope_connect_worker = _TelescopeConnectWorker(
+            endpoint_text=endpoint_text,
+            host=host,
+            port=port,
+            device=device,
+            epoch=self._epoch,
+            timeout_s=TIMEOUTS.telescope_connect_s,
+        )
+        self._telescope_connect_worker.moveToThread(self._telescope_connect_thread)
+        self._telescope_connect_thread.started.connect(self._telescope_connect_worker.run)
+        self._telescope_connect_worker.connected.connect(self._on_telescope_connected)
+        self._telescope_connect_worker.failed.connect(self._on_telescope_connect_failed)
+        self._telescope_connect_worker.finished.connect(self._on_telescope_connect_finished)
+        self._telescope_connect_worker.finished.connect(self._telescope_connect_thread.quit)
+        self._telescope_connect_worker.finished.connect(self._telescope_connect_worker.deleteLater)
+        self._telescope_connect_thread.finished.connect(self._telescope_connect_thread.deleteLater)
+        self._telescope_connect_thread.start()
+
+    @QtCore.Slot(object, str)
+    def _on_telescope_connected(self, scope: object, endpoint_text: str) -> None:
+        if self._settings.telescope_selected != endpoint_text:
+            return
+
+        self._telescope = scope  # type: ignore[assignment]
         self._telescope_last_error = None
-        logger.info("Connected telescope %s", self._selected_telescope_name())
+        logger.info("Connected telescope %s", endpoint_text)
+        self._refresh_status_lines()
+
+    @QtCore.Slot(str, str)
+    def _on_telescope_connect_failed(self, error_text: str, endpoint_text: str) -> None:
+        if self._settings.telescope_selected != endpoint_text:
+            return
+
+        self._telescope_last_error = error_text
+        self._telescope = None
+        logger.warning("Telescope connect failed (%s): %s", endpoint_text, error_text)
+        self._refresh_status_lines()
+
+    @QtCore.Slot()
+    def _on_telescope_connect_finished(self) -> None:
+        self._telescope_connect_in_progress = False
+        self._telescope_connect_worker = None
+        self._telescope_connect_thread = None
 
     def _mount_provider(self) -> Coordinates:
         if self._telescope is not None:
@@ -988,20 +1105,50 @@ class MainWindow(QtWidgets.QMainWindow):
             f"Min: {min_text} ({min_count}) | Mean: {mean_val:.2f} | Max: {max_text} ({max_count})"
         )
 
+    @QtCore.Slot(int)
+    def _on_stretch_changed(self, value: int) -> None:
+        level = min(100, max(0, int(value)))
+        self._settings.image_stretch_level = level
+        self._stretch_label.setText(f"Stretch: {level}")
+        if self._latest_frame is not None:
+            self._render_frame(self._latest_frame)
+
+    def _stretch_percentiles(self) -> tuple[float, float]:
+        level = float(min(100, max(0, self._settings.image_stretch_level)))
+        if level <= 50.0:
+            t = level / 50.0
+            low_pct = 0.0 + (5.0 * t)
+            high_pct = 100.0 - (0.5 * t)
+        else:
+            t = (level - 50.0) / 50.0
+            low_pct = 5.0 + (15.0 * t)
+            high_pct = 99.5 - (1.5 * t)
+        return low_pct, high_pct
+
     def resizeEvent(self, event: QtGui.QResizeEvent) -> None:
         super().resizeEvent(event)
         if not self.isMaximized() and not self.isFullScreen():
-            self._settings.app_window_width = int(self.width())
-            self._settings.app_window_height = int(self.height())
+            width = int(self.width())
+            height = int(self.height())
+            screen = self.screen() or QtGui.QGuiApplication.primaryScreen()
+            if screen is not None:
+                available = screen.availableGeometry()
+                width = min(width, max(800, available.width()))
+                height = min(height, max(600, available.height()))
+            self._settings.app_window_width = max(800, width)
+            self._settings.app_window_height = max(600, height)
         if self._latest_frame is not None:
             self._render_frame(self._latest_frame)
 
     def _stretch_image(self, image: np.ndarray) -> np.ndarray:
         arr = image.astype(np.float32)
-        lo = np.percentile(arr, 5)
-        hi = np.percentile(arr, 99.5)
+        lo_pct, hi_pct = self._stretch_percentiles()
+        lo = np.percentile(arr, lo_pct)
+        hi = np.percentile(arr, hi_pct)
         if hi <= lo:
-            hi = lo + 1.0
+            # Uniform image: render bright if data is non-zero (saturated edge case), otherwise black.
+            fill_value = 255 if float(np.max(arr)) > 0.0 else 0
+            return np.full(arr.shape, fill_value, dtype=np.uint8)
         scaled = np.clip((arr - lo) / (hi - lo), 0, 1) * 255.0
         return scaled.astype(np.uint8)
 
@@ -1148,6 +1295,37 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         self._refresh_status_lines()
 
+    def _update_action_buttons(self, telescope_connected: bool, camera_connected: bool) -> None:
+        calibration_ready = self._latest_calibration is not None and self._store.is_manual_invalidated() is False
+
+        align_reasons: list[str] = []
+        if not telescope_connected:
+            align_reasons.append("telescope is not connected")
+        if not camera_connected:
+            align_reasons.append("camera is not connected")
+        if not calibration_ready:
+            align_reasons.append("finder calibration is missing or invalid")
+
+        if align_reasons:
+            self._align_telescope_btn.setEnabled(False)
+            self._align_telescope_btn.setToolTip(f"Align is unavailable: {', '.join(align_reasons)}.")
+        else:
+            self._align_telescope_btn.setEnabled(True)
+            self._align_telescope_btn.setToolTip(f"Capture, solve, and align {MAIN_SCOPE_NAME}.")
+
+        calibrate_reasons: list[str] = []
+        if not telescope_connected:
+            calibrate_reasons.append("telescope is not connected")
+        if not camera_connected:
+            calibrate_reasons.append("camera is not connected")
+
+        if calibrate_reasons:
+            self._calibrate_finder_btn.setEnabled(False)
+            self._calibrate_finder_btn.setToolTip(f"Calibration is unavailable: {', '.join(calibrate_reasons)}.")
+        else:
+            self._calibrate_finder_btn.setEnabled(True)
+            self._calibrate_finder_btn.setToolTip("Run the calibration wizard for finder-to-main offset.")
+
     def _test_plate_solve(self) -> None:
         if self._solver is None:
             QtWidgets.QMessageBox.warning(self, "Unavailable", "Plate solver is not configured.")
@@ -1205,13 +1383,14 @@ class MainWindow(QtWidgets.QMainWindow):
             QtWidgets.QApplication.processEvents(QtCore.QEventLoop.ProcessEventsFlag.AllEvents, 50)
 
     def _refresh_status_lines(self) -> None:
+        telescope_connected = False
         if self._settings.telescope_selected is None:
             self._telescope_status.setText("Telescope: No telescope selected")
         elif self._telescope is None:
             suffix = f" | retrying in {self._settings.reconnect_interval_s}s"
             if self._telescope_last_error:
                 self._telescope_status.setText(
-                    f"Telescope: {self._selected_telescope_name()} disconnected ({self._telescope_last_error}){suffix}"
+                    f"Telescope: {self._selected_telescope_name()} disconnected ({self._short_error(self._telescope_last_error)}){suffix}"
                 )
             else:
                 self._telescope_status.setText(f"Telescope: {self._selected_telescope_name()} disconnected{suffix}")
@@ -1219,10 +1398,13 @@ class MainWindow(QtWidgets.QMainWindow):
             try:
                 connected = self._telescope.is_connected()
                 if not connected:
+                    # Drop stale object so only timer-driven reconnect is attempted.
+                    self._telescope = None
                     self._telescope_status.setText(
                         f"Telescope: {self._selected_telescope_name()} disconnected | retrying in {self._settings.reconnect_interval_s}s"
                     )
                 else:
+                    telescope_connected = True
                     coords = self._telescope.get_coordinates(timeout_s=1.0)
                     slewing = self._telescope.is_slewing()
                     slew_text = " | slewing" if slewing else ""
@@ -1233,11 +1415,16 @@ class MainWindow(QtWidgets.QMainWindow):
                         f"{slew_text}"
                     )
             except Exception as exc:  # noqa: BLE001
+                # Avoid repeated blocking reads on a dead endpoint; retry via reconnect timer.
+                self._telescope = None
                 self._telescope_status.setText(
-                    f"Telescope: {self._selected_telescope_name()} disconnected ({exc}) | retrying in {self._settings.reconnect_interval_s}s"
+                    "Telescope: "
+                    f"{self._selected_telescope_name()} disconnected ({self._short_error(str(exc))}) | "
+                    f"retrying in {self._settings.reconnect_interval_s}s"
                 )
 
         loop_state = "looping" if self._live_timer.isActive() else "stopped"
+        camera_connected = False
         camera_name = {
             "none": "No camera selected",
             "zwo": "ZWO camera",
@@ -1249,7 +1436,7 @@ class MainWindow(QtWidgets.QMainWindow):
         elif self._camera is None:
             if self._camera_last_error:
                 self._camera_status.setText(
-                    f"Camera: {camera_name} disconnected ({self._camera_last_error}) | "
+                    f"Camera: {camera_name} disconnected ({self._short_error(self._camera_last_error)}) | "
                     f"exp {self._settings.camera_exposure_ms} ms | gain {self._settings.camera_gain} | {loop_state}"
                 )
             else:
@@ -1258,10 +1445,23 @@ class MainWindow(QtWidgets.QMainWindow):
                     f"gain {self._settings.camera_gain} | {loop_state}"
                 )
         else:
-            self._camera_status.setText(
-                f"Camera: {camera_name} connected | exp {self._settings.camera_exposure_ms} ms | "
-                f"gain {self._settings.camera_gain} | {loop_state}"
-            )
+            try:
+                camera_connected = bool(self._camera.is_connected())
+            except Exception as exc:  # noqa: BLE001
+                camera_connected = False
+                self._camera_last_error = str(exc)
+                self._disconnect_camera()
+
+            if camera_connected:
+                self._camera_status.setText(
+                    f"Camera: {camera_name} connected | exp {self._settings.camera_exposure_ms} ms | "
+                    f"gain {self._settings.camera_gain} | {loop_state}"
+                )
+            else:
+                self._camera_status.setText(
+                    f"Camera: {camera_name} disconnected | exp {self._settings.camera_exposure_ms} ms | "
+                    f"gain {self._settings.camera_gain} | {loop_state}"
+                )
 
         self._latest_calibration = self._store.load_latest()
         if self._latest_calibration is None:
@@ -1275,7 +1475,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 f"Dec {self._latest_calibration.offset_dec_deg:.5f}°"
             )
 
-        self._align_telescope_btn.setEnabled(self._latest_calibration is not None and self._store.is_manual_invalidated() is False)
+        self._update_action_buttons(telescope_connected=telescope_connected, camera_connected=camera_connected)
 
     def _discover_telescopes(self, show_dialog: bool = True) -> list[DiscoveredTelescope]:
         # Discovery retained for future UI use; intentionally not exposed in the main UX.
@@ -1312,6 +1512,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self._status_timer.stop()
         self._telescope_retry_timer.stop()
         self._camera_retry_timer.stop()
+
+        if self._telescope_connect_thread is not None:
+            self._telescope_connect_thread.quit()
+            self._telescope_connect_thread.wait(1000)
 
         if self._capture_thread is not None:
             self._capture_thread.quit()
