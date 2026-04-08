@@ -64,6 +64,17 @@ class AstapPlateSolver(PlateSolver):
             command.extend(["-r", "181"])
             return command, False
 
+    def _log_astap_feedback(self, stage: str, completed: subprocess.CompletedProcess[str], input_path: str) -> None:
+        stdout_text = (completed.stdout or "").strip()
+        stderr_text = (completed.stderr or "").strip()
+        sidecar_text = self._read_sidecar_text(input_path)
+
+        logger.info("ASTAP %s return_code=%s", stage, completed.returncode)
+        logger.info("ASTAP %s stdout:\n%s", stage, stdout_text if stdout_text else "<empty>")
+        logger.info("ASTAP %s stderr:\n%s", stage, stderr_text if stderr_text else "<empty>")
+        if sidecar_text:
+            logger.info("ASTAP %s sidecar diagnostics:\n%s", stage, sidecar_text)
+
     def _summarize_output(self, stdout: str, stderr: str, max_chars: int = 400) -> str:
         text = (stderr or "").strip()
         if not text:
@@ -345,7 +356,7 @@ class AstapPlateSolver(PlateSolver):
 
         try:
             command, used_hint = self._build_command(input_path)
-            logger.debug("Running ASTAP command: %s", subprocess.list2cmdline(command))
+            logger.info("Running ASTAP command: %s", subprocess.list2cmdline(command))
             try:
                 completed = subprocess.run(command, capture_output=True, text=True, timeout=timeout_s, check=False)
             except subprocess.TimeoutExpired:
@@ -361,12 +372,14 @@ class AstapPlateSolver(PlateSolver):
             except OSError as exc:
                 return SolveResult(success=False, message=f"Failed to start ASTAP: {exc}")
 
+            self._log_astap_feedback("primary", completed, input_path)
+
             coordinates = self._parse_solution_coordinates(input_path) if completed.returncode == 0 else None
             needs_blind_retry = used_hint and (completed.returncode != 0 or coordinates is None)
 
             if needs_blind_retry:
                 blind_command, _ = self._build_command(input_path, force_blind=True)
-                logger.debug(
+                logger.info(
                     "ASTAP hinted solve failed; retrying blind search command: %s",
                     subprocess.list2cmdline(blind_command),
                 )
@@ -384,6 +397,7 @@ class AstapPlateSolver(PlateSolver):
                     return SolveResult(success=False, message=f"Failed to start ASTAP blind retry: {exc}")
 
                 completed = blind_completed
+                self._log_astap_feedback("blind-retry", completed, input_path)
                 coordinates = self._parse_solution_coordinates(input_path) if completed.returncode == 0 else None
 
             if completed.returncode != 0:

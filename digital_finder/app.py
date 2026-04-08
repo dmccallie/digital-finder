@@ -182,6 +182,121 @@ class _TelescopeConnectWorker(QtCore.QObject):
             self.finished.emit()
 
 
+class _ZoomableImageView(QtWidgets.QGraphicsView):
+    def __init__(self, parent: QtWidgets.QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._scene = QtWidgets.QGraphicsScene(self)
+        self.setScene(self._scene)
+        self._pixmap_item = QtWidgets.QGraphicsPixmapItem()
+        self._pixmap_item.setTransformationMode(QtCore.Qt.TransformationMode.SmoothTransformation)
+        self._scene.addItem(self._pixmap_item)
+        self._text_item: QtWidgets.QGraphicsSimpleTextItem | None = None
+        self._has_image = False
+        self._user_interacted = False
+        self._min_zoom = 0.2
+        self._max_zoom = 15.0
+
+        self.setBackgroundBrush(QtGui.QBrush(QtGui.QColor("#111")))
+        self.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
+        self.setRenderHints(QtGui.QPainter.RenderHint.Antialiasing | QtGui.QPainter.RenderHint.SmoothPixmapTransform)
+        self.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.setTransformationAnchor(QtWidgets.QGraphicsView.ViewportAnchor.AnchorUnderMouse)
+        self.setResizeAnchor(QtWidgets.QGraphicsView.ViewportAnchor.AnchorViewCenter)
+        self.setDragMode(QtWidgets.QGraphicsView.DragMode.NoDrag)
+
+    def set_placeholder(self, text: str) -> None:
+        self._has_image = False
+        self._user_interacted = False
+        self.resetTransform()
+        self._pixmap_item.setPixmap(QtGui.QPixmap())
+        self._scene.setSceneRect(QtCore.QRectF())
+        if self._text_item is not None:
+            self._scene.removeItem(self._text_item)
+            self._text_item = None
+
+        self._text_item = self._scene.addSimpleText(text)
+        self._text_item.setBrush(QtGui.QBrush(QtGui.QColor("#eee")))
+        self._position_placeholder_text()
+
+    def set_pixmap(self, pixmap: QtGui.QPixmap) -> None:
+        if self._text_item is not None:
+            self._scene.removeItem(self._text_item)
+            self._text_item = None
+
+        self._pixmap_item.setPixmap(pixmap)
+        self._scene.setSceneRect(self._pixmap_item.boundingRect())
+        first_image = not self._has_image
+        self._has_image = True
+        if first_image or not self._user_interacted:
+            self.reset_view()
+
+    def reset_view(self) -> None:
+        if not self._has_image:
+            return
+        rect = self._pixmap_item.boundingRect()
+        if rect.isEmpty():
+            return
+        self._user_interacted = False
+        self.resetTransform()
+        self.fitInView(rect, QtCore.Qt.AspectRatioMode.KeepAspectRatio)
+
+    def wheelEvent(self, event: QtGui.QWheelEvent) -> None:
+        if not self._has_image:
+            super().wheelEvent(event)
+            return
+
+        delta_y = event.angleDelta().y()
+        if delta_y == 0:
+            event.accept()
+            return
+
+        factor = 1.15 if delta_y > 0 else (1.0 / 1.15)
+        current_scale = self.transform().m11()
+        target_scale = current_scale * factor
+        if target_scale < self._min_zoom:
+            factor = self._min_zoom / current_scale
+        elif target_scale > self._max_zoom:
+            factor = self._max_zoom / current_scale
+
+        self._user_interacted = True
+        self.scale(factor, factor)
+        event.accept()
+
+    def mousePressEvent(self, event: QtGui.QMouseEvent) -> None:
+        if self._has_image and event.button() == QtCore.Qt.MouseButton.LeftButton:
+            self._user_interacted = True
+            self.setDragMode(QtWidgets.QGraphicsView.DragMode.ScrollHandDrag)
+        super().mousePressEvent(event)
+
+    def mouseReleaseEvent(self, event: QtGui.QMouseEvent) -> None:
+        super().mouseReleaseEvent(event)
+        if event.button() == QtCore.Qt.MouseButton.LeftButton:
+            self.setDragMode(QtWidgets.QGraphicsView.DragMode.NoDrag)
+
+    def mouseDoubleClickEvent(self, event: QtGui.QMouseEvent) -> None:
+        if self._has_image and event.button() == QtCore.Qt.MouseButton.LeftButton:
+            self.reset_view()
+            event.accept()
+            return
+        super().mouseDoubleClickEvent(event)
+
+    def resizeEvent(self, event: QtGui.QResizeEvent) -> None:
+        super().resizeEvent(event)
+        if self._has_image and not self._user_interacted:
+            self.reset_view()
+        if self._text_item is not None:
+            self._position_placeholder_text()
+
+    def _position_placeholder_text(self) -> None:
+        if self._text_item is None:
+            return
+        vp_rect = self.viewport().rect()
+        scene_center = self.mapToScene(vp_rect.center())
+        text_rect = self._text_item.boundingRect()
+        self._text_item.setPos(scene_center.x() - text_rect.width() / 2, scene_center.y() - text_rect.height() / 2)
+
+
 class TelescopeSettingsDialog(QtWidgets.QDialog):
     def __init__(self, history: list[str], selected: str | None, parent: QtWidgets.QWidget | None = None) -> None:
         super().__init__(parent)
@@ -601,10 +716,9 @@ class MainWindow(QtWidgets.QMainWindow):
 
         image_panel = QtWidgets.QGroupBox("Latest Finder Image")
         image_layout = QtWidgets.QVBoxLayout(image_panel)
-        self._image_label = QtWidgets.QLabel("No image")
-        self._image_label.setMinimumSize(640, 480)
-        self._image_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
-        self._image_label.setStyleSheet("QLabel { background-color: #111; color: #eee; }")
+        self._image_view = _ZoomableImageView()
+        self._image_view.setMinimumSize(640, 480)
+        self._image_view.set_placeholder("No image")
         self._image_stats_label = QtWidgets.QLabel("Min: - | Mean: - | Max: -")
         self._image_stats_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignLeft)
         self._image_stats_label.setWordWrap(False)
@@ -612,7 +726,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._image_stats_label.setMinimumHeight(22)
         self._image_stats_label.setMaximumHeight(22)
         stretch_row = QtWidgets.QHBoxLayout()
-        self._stretch_label = QtWidgets.QLabel("Stretch: 50")
+        self._stretch_label = QtWidgets.QLabel(f"Stretch: {self._settings.image_stretch_level}")
         self._stretch_label.setMinimumWidth(92)
         self._stretch_slider = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
         self._stretch_slider.setRange(0, 100)
@@ -621,9 +735,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self._stretch_slider.setValue(self._settings.image_stretch_level)
         self._stretch_slider.setToolTip("Adjust display stretch for the latest finder image.")
         self._stretch_slider.valueChanged.connect(self._on_stretch_changed)
+        self._reset_view_btn = QtWidgets.QPushButton("Reset View")
+        self._reset_view_btn.setToolTip("Reset zoom and pan to fit the image.")
+        self._reset_view_btn.clicked.connect(self._image_view.reset_view)
         stretch_row.addWidget(self._stretch_label)
         stretch_row.addWidget(self._stretch_slider, 1)
-        image_layout.addWidget(self._image_label)
+        stretch_row.addWidget(self._reset_view_btn)
+        image_layout.addWidget(self._image_view)
         image_layout.addWidget(self._image_stats_label)
         image_layout.addLayout(stretch_row)
         image_layout.setStretch(0, 1)
@@ -1065,22 +1183,35 @@ class MainWindow(QtWidgets.QMainWindow):
     def _render_frame(self, frame: Frame) -> None:
         data = frame.data
         if not isinstance(data, np.ndarray):
-            self._image_label.setText("Unsupported image data")
+            self._image_view.set_placeholder("Unsupported image data")
             self._image_stats_label.setText("Min: - | Mean: - | Max: -")
             return
 
         stretched = self._stretch_image(data)
+        stretched = self._apply_display_smoothing(stretched)
         h, w = stretched.shape
         qimg = QtGui.QImage(stretched.data, w, h, w, QtGui.QImage.Format.Format_Grayscale8).copy()
         pixmap = QtGui.QPixmap.fromImage(qimg)
-        self._image_label.setPixmap(
-            pixmap.scaled(
-                self._image_label.size(),
-                QtCore.Qt.AspectRatioMode.KeepAspectRatio,
-                QtCore.Qt.TransformationMode.SmoothTransformation,
-            )
-        )
+        self._image_view.set_pixmap(pixmap)
         self._update_image_stats(data)
+
+    def _apply_display_smoothing(self, stretched: np.ndarray) -> np.ndarray:
+        # RAW Bayer-like frames can show checkerboard aliasing when displayed at reduced scale.
+        # Apply a light 2x2 average for display only; solve/capture data is unchanged.
+        if self._settings.camera_data_type != CameraDataType.RAW16.value:
+            return stretched
+
+        if stretched.ndim != 2 or stretched.shape[0] < 2 or stretched.shape[1] < 2:
+            return stretched
+
+        arr = stretched.astype(np.uint16, copy=False)
+        smoothed = arr.copy()
+        smoothed[1:, 1:] = (
+            arr[1:, 1:] + arr[:-1, 1:] + arr[1:, :-1] + arr[:-1, :-1]
+        ) // 4
+        smoothed[0, :] = smoothed[1, :]
+        smoothed[:, 0] = smoothed[:, 1]
+        return smoothed.astype(np.uint8, copy=False)
 
     def _update_image_stats(self, image: np.ndarray) -> None:
         arr = np.asarray(image)
@@ -1174,6 +1305,16 @@ class MainWindow(QtWidgets.QMainWindow):
         self._store.save_new(record)
         self._store.set_manual_invalidated(False)
         self._latest_calibration = record
+        logger.info(
+            "Finder calibration completed star=%s mount_ra=%.6f mount_dec=%.6f finder_ra=%.6f finder_dec=%.6f offset_ra=%.6f offset_dec=%.6f",
+            record.star_name,
+            record.mount_ra_deg,
+            record.mount_dec_deg,
+            record.finder_ra_deg,
+            record.finder_dec_deg,
+            record.offset_ra_deg,
+            record.offset_dec_deg,
+        )
         self._refresh_status_lines()
 
     def _capture_fresh_alignment_frame(self) -> Frame:
@@ -1285,6 +1426,18 @@ class MainWindow(QtWidgets.QMainWindow):
             logger.exception("Telescope alignment sync failed")
             QtWidgets.QMessageBox.critical(self, "Sync Failed", str(exc))
             return
+
+        logger.info(
+            "Main scope alignment sent scope=%s solved_ra=%.6f solved_dec=%.6f sent_ra=%.6f sent_dec=%.6f cal_star=%s cal_offset_ra=%.6f cal_offset_dec=%.6f",
+            MAIN_SCOPE_NAME,
+            solved.ra_deg,
+            solved.dec_deg,
+            target.ra_deg,
+            target.dec_deg,
+            self._latest_calibration.star_name,
+            self._latest_calibration.offset_ra_deg,
+            self._latest_calibration.offset_dec_deg,
+        )
 
         QtWidgets.QMessageBox.information(
             self,
