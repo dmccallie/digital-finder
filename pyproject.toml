@@ -16,3 +16,8 @@ dependencies = [
 
 [project.scripts]
 digital-finder = "main:main"
+
+[dependency-groups]
+dev = [
+    "pyinstaller>=6.19.0",
+]
