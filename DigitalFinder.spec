@@ -1,6 +1,7 @@
 # -*- mode: python ; coding: utf-8 -*-
 
 import os
+import site
 from pathlib import Path
 
 
@@ -12,28 +13,40 @@ if samples_dir.exists():
     datas.append((str(samples_dir), 'samples'))
 
 binaries = []
+asi_dll_path = None
 
-# Preferred override: set ASICAMERA2_DLL to a concrete DLL path before build.
+
+def _find_pyzwoasi_packaged_dll() -> Path | None:
+    candidate_roots = []
+    try:
+        candidate_roots.extend(site.getsitepackages())
+    except Exception:
+        pass
+    try:
+        candidate_roots.append(site.getusersitepackages())
+    except Exception:
+        pass
+
+    for root in candidate_roots:
+        candidate = Path(root) / 'pyzwoasi' / 'lib' / 'Windows' / 'x64' / 'ASICamera2.dll'
+        if candidate.is_file():
+            return candidate
+    return None
+
+# Optional override: set ASICAMERA2_DLL to a known-good SDK DLL.
+# If not set, keep pyzwoasi's bundled DLL (usually best version match for wrappers).
 env_dll = os.environ.get('ASICAMERA2_DLL')
 if env_dll and Path(env_dll).is_file():
-    binaries.append((env_dll, '.'))
+    asi_dll_path = Path(env_dll)
 else:
-    candidates = [
-        project_root / 'ASICamera2.dll',
-        Path(os.environ.get('ProgramFiles', '')) / 'ASIStudio' / 'ASICamera2.dll',
-        Path(os.environ.get('ProgramFiles', '')) / 'ZWO' / 'ASICamera2.dll',
-        Path(os.environ.get('ProgramFiles', '')) / 'ZWO Design' / 'ASI Cameras' / 'ASICamera2.dll',
-        Path(os.environ.get('ProgramFiles', '')) / 'ZWO Design' / 'ASI Cameras' / 'SDK' / 'lib' / 'x64' / 'ASICamera2.dll',
-        Path(os.environ.get('ProgramFiles(x86)', '')) / 'ZWO Design' / 'ASI Cameras' / 'ASICamera2.dll',
-        Path(os.environ.get('ProgramFiles(x86)', '')) / 'ZWO Design' / 'ASI Cameras' / 'SDK' / 'lib' / 'x64' / 'ASICamera2.dll',
-    ]
-    for candidate in candidates:
-        if candidate.is_file():
-            binaries.append((str(candidate), '.'))
-            break
+    asi_dll_path = _find_pyzwoasi_packaged_dll()
 
-if not binaries:
-    print('WARNING: ASICamera2.dll was not found during build. Set ASICAMERA2_DLL to include it in dist output.')
+if asi_dll_path is not None:
+    # pyzwoasi currently hard-loads this exact in-package DLL path at import time.
+    binaries.append((str(asi_dll_path), 'pyzwoasi/lib/Windows/x64'))
+    print(f'Using ASICamera2 override DLL: {asi_dll_path}')
+else:
+    print('WARNING: Could not find pyzwoasi ASICamera2.dll; camera backend may fail in frozen build.')
 
 
 a = Analysis(
