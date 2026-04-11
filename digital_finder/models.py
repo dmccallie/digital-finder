@@ -4,6 +4,8 @@ from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from typing import Any
 
+from astronomy import Horizon, Observer, Refraction, Time
+
 
 def now_utc_iso() -> str:
     return datetime.now(tz=timezone.utc).isoformat()
@@ -39,6 +41,34 @@ def format_ra_deg_with_hms(ra_deg: float, precision: int = 5) -> str:
 
 def format_dec_deg_with_dms(dec_deg: float, precision: int = 5) -> str:
     return f"{dec_deg:.{precision}f}° ({format_dec_dms(dec_deg)})"
+
+
+@dataclass(frozen=True)
+class HorizontalCoordinates:
+    altitude_deg: float
+    azimuth_deg: float
+
+
+def format_horizontal_deg(horizontal: HorizontalCoordinates, precision: int = 3) -> str:
+    return f"Alt {horizontal.altitude_deg:.{precision}f}°, Az {horizontal.azimuth_deg:.{precision}f}°"
+
+
+def radec_to_horizontal(
+    ra_deg: float,
+    dec_deg: float,
+    observer_latitude_deg: float,
+    observer_longitude_deg: float,
+) -> HorizontalCoordinates:
+    observer = Observer(latitude=observer_latitude_deg, longitude=observer_longitude_deg, height=0.0)
+    now = Time.Now()
+    horizontal = Horizon(
+        now,
+        observer,
+        wrap_ra_deg(ra_deg) / 15.0,
+        clamp_dec_deg(dec_deg),
+        Refraction.Normal,
+    )
+    return HorizontalCoordinates(altitude_deg=horizontal.altitude, azimuth_deg=horizontal.azimuth)
 
 
 @dataclass

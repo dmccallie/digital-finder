@@ -10,10 +10,12 @@ from digital_finder.models import (
     Coordinates,
     Frame,
     SolveResult,
+    format_horizontal_deg,
     format_plate_solve_metrics,
     format_dec_deg_with_dms,
     format_ra_deg_with_hms,
     now_utc_iso,
+    radec_to_horizontal,
     wrap_ra_deg,
 )
 from digital_finder.services.interfaces import PlateSolver, TelescopeClient
@@ -29,6 +31,8 @@ class AlignmentWizardDialog(QtWidgets.QDialog):
         solver: PlateSolver,
         frame_provider,
         epoch: str,
+        observatory_latitude_deg: float,
+        observatory_longitude_deg: float,
         parent: QtWidgets.QWidget | None = None,
     ) -> None:
         super().__init__(parent)
@@ -40,6 +44,8 @@ class AlignmentWizardDialog(QtWidgets.QDialog):
         self._solver = solver
         self._frame_provider = frame_provider
         self._epoch = epoch
+        self._observatory_latitude_deg = observatory_latitude_deg
+        self._observatory_longitude_deg = observatory_longitude_deg
         self._calibration_record: CalibrationRecord | None = None
 
         self._status = QtWidgets.QLabel("Step 1: Select an alignment star.")
@@ -51,7 +57,8 @@ class AlignmentWizardDialog(QtWidgets.QDialog):
             self._star_combo.addItem(
                 f"{star.name} ("
                 f"RA {format_ra_deg_with_hms(star.ra_deg, precision=3)}, "
-                f"Dec {format_dec_deg_with_dms(star.dec_deg, precision=3)}"
+                f"Dec {format_dec_deg_with_dms(star.dec_deg, precision=3)}, "
+                f"{self._format_altaz_text(star.ra_deg, star.dec_deg, precision=2)}"
                 f")",
                 star,
             )
@@ -233,7 +240,8 @@ class AlignmentWizardDialog(QtWidgets.QDialog):
             "Finder Calibration solve successful.\n\n"
             f"Solved coordinates:\n"
             f"RA {format_ra_deg_with_hms(finder.ra_deg, precision=6)}\n"
-            f"Dec {format_dec_deg_with_dms(finder.dec_deg, precision=6)}\n\n"
+            f"Dec {format_dec_deg_with_dms(finder.dec_deg, precision=6)}\n"
+            f"{self._format_altaz_text(finder.ra_deg, finder.dec_deg, precision=3)}\n\n"
             f"Solved minus star ({star.name}):\n"
             f"dRA {solved_minus_star_ra:.6f}°\n"
             f"dDec {solved_minus_star_dec:.6f}°\n\n"
@@ -241,3 +249,16 @@ class AlignmentWizardDialog(QtWidgets.QDialog):
             f"{metrics_block}",
         )
         self.accept()
+
+    def _format_altaz_text(self, ra_deg: float, dec_deg: float, precision: int = 3) -> str:
+        try:
+            horizontal = radec_to_horizontal(
+                ra_deg=ra_deg,
+                dec_deg=dec_deg,
+                observer_latitude_deg=self._observatory_latitude_deg,
+                observer_longitude_deg=self._observatory_longitude_deg,
+            )
+            return format_horizontal_deg(horizontal, precision=precision)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("Failed Alt/Az conversion for ra=%.6f dec=%.6f: %s", ra_deg, dec_deg, exc)
+            return "Alt/Az unavailable"

@@ -25,6 +25,8 @@ from digital_finder.config import (
     DEFAULT_ALPACA_HOST,
     DEFAULT_ALPACA_PORT,
     DEFAULT_EPOCH,
+    DEFAULT_OBSERVATORY_LATITUDE_DEG,
+    DEFAULT_OBSERVATORY_LONGITUDE_DEG,
     KNOWN_ALPACA_TELESCOPES,
     SOLVER_CONFIG,
     TIMEOUTS,
@@ -36,9 +38,11 @@ from digital_finder.models import (
     SolveResult,
     clamp_dec_deg,
     format_dec_deg_with_dms,
+    format_horizontal_deg,
     format_plate_solve_metrics,
     format_ra_deg_with_hms,
     now_utc_iso,
+    radec_to_horizontal,
     wrap_ra_deg,
 )
 from digital_finder.services.alpaca_telescope import AlpacaTelescopeClient, DiscoveredTelescope, discover_alpaca_telescopes
@@ -72,6 +76,8 @@ class PersistentSettings:
     reconnect_interval_s: int = 5
     logging_level: str = "INFO"
     image_stretch_level: int = 50
+    observatory_latitude_deg: float = DEFAULT_OBSERVATORY_LATITUDE_DEG
+    observatory_longitude_deg: float = DEFAULT_OBSERVATORY_LONGITUDE_DEG
     app_window_width: int = 1100
     app_window_height: int = 720
 
@@ -95,6 +101,8 @@ class PersistentSettings:
             reconnect_interval_s=max(5, int(data.get("reconnect_interval_s", 5))),
             logging_level=str(data.get("logging_level", "INFO")).upper(),
             image_stretch_level=min(100, max(0, int(data.get("image_stretch_level", 50)))),
+            observatory_latitude_deg=max(-90.0, min(90.0, float(data.get("observatory_latitude_deg", DEFAULT_OBSERVATORY_LATITUDE_DEG)))),
+            observatory_longitude_deg=max(-180.0, min(180.0, float(data.get("observatory_longitude_deg", DEFAULT_OBSERVATORY_LONGITUDE_DEG)))),
             app_window_width=max(800, int(data.get("app_window_width", 1100))),
             app_window_height=max(600, int(data.get("app_window_height", 720))),
         )
@@ -117,6 +125,8 @@ class PersistentSettings:
             "reconnect_interval_s": self.reconnect_interval_s,
             "logging_level": self.logging_level,
             "image_stretch_level": self.image_stretch_level,
+            "observatory_latitude_deg": self.observatory_latitude_deg,
+            "observatory_longitude_deg": self.observatory_longitude_deg,
             "app_window_width": self.app_window_width,
             "app_window_height": self.app_window_height,
         }
@@ -560,7 +570,7 @@ class AppSettingsDialog(QtWidgets.QDialog):
     def __init__(self, settings: PersistentSettings, parent: QtWidgets.QWidget | None = None) -> None:
         super().__init__(parent)
         self.setWindowTitle("App Settings")
-        self.resize(520, 220)
+        self.resize(520, 300)
 
         self._epoch = QtWidgets.QComboBox()
         self._epoch.addItems(["J2000", "JNOW"])
@@ -575,6 +585,18 @@ class AppSettingsDialog(QtWidgets.QDialog):
         self._reconnect.setRange(5, 30)
         self._reconnect.setSuffix(" s")
         self._reconnect.setValue(settings.reconnect_interval_s)
+
+        self._observatory_latitude = QtWidgets.QDoubleSpinBox()
+        self._observatory_latitude.setRange(-90.0, 90.0)
+        self._observatory_latitude.setDecimals(6)
+        self._observatory_latitude.setSingleStep(0.01)
+        self._observatory_latitude.setValue(settings.observatory_latitude_deg)
+
+        self._observatory_longitude = QtWidgets.QDoubleSpinBox()
+        self._observatory_longitude.setRange(-180.0, 180.0)
+        self._observatory_longitude.setDecimals(6)
+        self._observatory_longitude.setSingleStep(0.01)
+        self._observatory_longitude.setValue(settings.observatory_longitude_deg)
 
         self._logging_level = QtWidgets.QComboBox()
         self._logging_level.addItems(["DEBUG", "INFO", "WARNING", "ERROR"])
@@ -593,14 +615,18 @@ class AppSettingsDialog(QtWidgets.QDialog):
         grid.addWidget(self._astap_downsize, 2, 1)
         grid.addWidget(QtWidgets.QLabel("Reconnect interval"), 3, 0)
         grid.addWidget(self._reconnect, 3, 1)
-        grid.addWidget(QtWidgets.QLabel("Logging level"), 4, 0)
-        grid.addWidget(self._logging_level, 4, 1)
+        grid.addWidget(QtWidgets.QLabel("Observatory latitude"), 4, 0)
+        grid.addWidget(self._observatory_latitude, 4, 1)
+        grid.addWidget(QtWidgets.QLabel("Observatory longitude"), 5, 0)
+        grid.addWidget(self._observatory_longitude, 5, 1)
+        grid.addWidget(QtWidgets.QLabel("Logging level"), 6, 0)
+        grid.addWidget(self._logging_level, 6, 1)
 
         row = QtWidgets.QHBoxLayout()
         row.addStretch(1)
         row.addWidget(cancel)
         row.addWidget(save)
-        grid.addLayout(row, 5, 0, 1, 2)
+        grid.addLayout(row, 7, 0, 1, 2)
 
         save.clicked.connect(self.accept)
         cancel.clicked.connect(self.reject)
@@ -610,6 +636,8 @@ class AppSettingsDialog(QtWidgets.QDialog):
         settings.astap_executable = self._astap.text().strip() or SOLVER_CONFIG.astap_executable
         settings.astap_downsize_factor = max(1, int(self._astap_downsize.value()))
         settings.reconnect_interval_s = int(self._reconnect.value())
+        settings.observatory_latitude_deg = float(self._observatory_latitude.value())
+        settings.observatory_longitude_deg = float(self._observatory_longitude.value())
         settings.logging_level = self._logging_level.currentText()
 
 
@@ -1293,6 +1321,8 @@ class MainWindow(QtWidgets.QMainWindow):
             solver=self._solver,
             frame_provider=self._capture_fresh_alignment_frame,
             epoch=self._epoch,
+            observatory_latitude_deg=self._settings.observatory_latitude_deg,
+            observatory_longitude_deg=self._settings.observatory_longitude_deg,
             parent=self,
         )
         if dialog.exec() != QtWidgets.QDialog.DialogCode.Accepted:
@@ -1401,10 +1431,12 @@ class MainWindow(QtWidgets.QMainWindow):
             "Step 3: Review before sending alignment\n\n"
             "Plate solve solution:\n"
             f"RA {format_ra_deg_with_hms(solved.ra_deg, precision=6)}\n"
-            f"Dec {format_dec_deg_with_dms(solved.dec_deg, precision=6)}\n\n"
+            f"Dec {format_dec_deg_with_dms(solved.dec_deg, precision=6)}\n"
+            f"{self._format_altaz_text(solved.ra_deg, solved.dec_deg, precision=3)}\n\n"
             "Corrected sync to send:\n"
             f"RA {format_ra_deg_with_hms(target.ra_deg, precision=6)}\n"
-            f"Dec {format_dec_deg_with_dms(target.dec_deg, precision=6)}"
+            f"Dec {format_dec_deg_with_dms(target.dec_deg, precision=6)}\n"
+            f"{self._format_altaz_text(target.ra_deg, target.dec_deg, precision=3)}"
         )
         if metrics_text:
             review_text = f"{review_text}\n\n{metrics_text}"
@@ -1444,7 +1476,8 @@ class MainWindow(QtWidgets.QMainWindow):
             f"{MAIN_SCOPE_NAME} Aligned",
             f"Alignment sent to {MAIN_SCOPE_NAME}:\n"
             f"RA {format_ra_deg_with_hms(target.ra_deg, precision=5)}\n"
-            f"Dec {format_dec_deg_with_dms(target.dec_deg, precision=5)}",
+            f"Dec {format_dec_deg_with_dms(target.dec_deg, precision=5)}\n"
+            f"{self._format_altaz_text(target.ra_deg, target.dec_deg, precision=3)}",
         )
         self._refresh_status_lines()
 
@@ -1520,7 +1553,8 @@ class MainWindow(QtWidgets.QMainWindow):
             coords = solve.coordinates
             details = (
                 f"RA {format_ra_deg_with_hms(coords.ra_deg, precision=6)}\n"
-                f"Dec {format_dec_deg_with_dms(coords.dec_deg, precision=6)}"
+                f"Dec {format_dec_deg_with_dms(coords.dec_deg, precision=6)}\n"
+                f"{self._format_altaz_text(coords.ra_deg, coords.dec_deg, precision=3)}"
             )
             metrics_text = format_plate_solve_metrics(solve.metrics)
             if metrics_text:
@@ -1564,7 +1598,8 @@ class MainWindow(QtWidgets.QMainWindow):
                     self._telescope_status.setText(
                         f"Telescope: {self._selected_telescope_name()} | "
                         f"RA {format_ra_deg_with_hms(coords.ra_deg, precision=5)} | "
-                        f"Dec {format_dec_deg_with_dms(coords.dec_deg, precision=5)}"
+                        f"Dec {format_dec_deg_with_dms(coords.dec_deg, precision=5)} | "
+                        f"{self._format_altaz_text(coords.ra_deg, coords.dec_deg, precision=2)}"
                         f"{slew_text}"
                     )
             except Exception as exc:  # noqa: BLE001
@@ -1656,6 +1691,19 @@ class MainWindow(QtWidgets.QMainWindow):
             return local.strftime("%Y-%m-%d %H:%M:%S %Z")
         except Exception:  # noqa: BLE001
             return timestamp_utc
+
+    def _format_altaz_text(self, ra_deg: float, dec_deg: float, precision: int = 3) -> str:
+        try:
+            horizontal = radec_to_horizontal(
+                ra_deg=ra_deg,
+                dec_deg=dec_deg,
+                observer_latitude_deg=self._settings.observatory_latitude_deg,
+                observer_longitude_deg=self._settings.observatory_longitude_deg,
+            )
+            return format_horizontal_deg(horizontal, precision=precision)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("Failed Alt/Az conversion for ra=%.6f dec=%.6f: %s", ra_deg, dec_deg, exc)
+            return "Alt/Az unavailable"
 
     def _exit_app(self) -> None:
         self.close()
