@@ -684,7 +684,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._live_timer.timeout.connect(self._capture_latest_frame)
 
         self._status_timer = QtCore.QTimer(self)
-        self._status_timer.setInterval(1000)
+        self._status_timer.setInterval(2000)
         self._status_timer.timeout.connect(self._refresh_status_lines)
 
         self._telescope_retry_timer = QtCore.QTimer(self)
@@ -700,8 +700,7 @@ class MainWindow(QtWidgets.QMainWindow):
         # Auto-start behavior from saved config.
         self._attempt_telescope_connect()
         self._attempt_camera_connect()
-        if self._settings.camera_looping:
-            self._live_timer.start()
+        self._sync_live_loop_timer()
 
         self._refresh_status_lines()
 
@@ -1110,10 +1109,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self._attempt_camera_connect()
             self._camera_retry_timer.start()
 
-        if self._settings.camera_looping:
-            self._live_timer.start()
-        else:
-            self._live_timer.stop()
+        self._sync_live_loop_timer(capture_immediately=True)
 
         self._refresh_status_lines()
 
@@ -1132,6 +1128,7 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         self._apply_retry_interval()
         self._save_settings()
+        self._sync_live_loop_timer()
         self._refresh_status_lines()
 
     def _apply_logging_level(self, level_name: str) -> None:
@@ -1142,11 +1139,39 @@ class MainWindow(QtWidgets.QMainWindow):
     def _toggle_live_loop(self, enabled: bool) -> None:
         self._settings.camera_looping = enabled
         self._save_settings()
-        if enabled:
-            self._live_timer.start()
-            self._capture_latest_frame()
+        self._sync_live_loop_timer(capture_immediately=True)
+
+    def _should_run_live_loop(self) -> bool:
+        return (
+            self._settings.camera_looping
+            and self._settings.camera_selected != "none"
+            and self.isVisible()
+            and not self.isMinimized()
+            and self._image_view.isVisibleTo(self)
+        )
+
+    def _sync_live_loop_timer(self, capture_immediately: bool = False) -> None:
+        should_run = self._should_run_live_loop()
+        if should_run:
+            if not self._live_timer.isActive():
+                self._live_timer.start()
+                if capture_immediately:
+                    self._capture_latest_frame()
         else:
             self._live_timer.stop()
+
+    def showEvent(self, event: QtGui.QShowEvent) -> None:
+        super().showEvent(event)
+        self._sync_live_loop_timer(capture_immediately=True)
+
+    def hideEvent(self, event: QtGui.QHideEvent) -> None:
+        self._sync_live_loop_timer()
+        super().hideEvent(event)
+
+    def changeEvent(self, event: QtCore.QEvent) -> None:
+        super().changeEvent(event)
+        if event.type() == QtCore.QEvent.Type.WindowStateChange:
+            self._sync_live_loop_timer(capture_immediately=True)
 
     def _capture_latest_frame(self) -> None:
         if self._capture_in_progress:
@@ -1296,8 +1321,6 @@ class MainWindow(QtWidgets.QMainWindow):
                 height = min(height, max(600, available.height()))
             self._settings.app_window_width = max(800, width)
             self._settings.app_window_height = max(600, height)
-        if self._latest_frame is not None:
-            self._render_frame(self._latest_frame)
 
     def _stretch_image(self, image: np.ndarray) -> np.ndarray:
         arr = image.astype(np.float32)

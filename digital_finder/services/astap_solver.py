@@ -56,7 +56,7 @@ class AstapPlateSolver(PlateSolver):
                 "-dec",
                 f"{hint.dec_deg:.6f}",
                 "-r",
-                "10",
+                "20",
             ])
             return command, True
         else:
