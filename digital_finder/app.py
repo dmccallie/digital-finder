@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import sys
 import time
 from dataclasses import dataclass
@@ -73,6 +74,9 @@ class PersistentSettings:
     app_epoch: str = DEFAULT_EPOCH
     astap_executable: str = SOLVER_CONFIG.astap_executable
     astap_downsize_factor: int = 1
+    finder_focal_length_mm: int = 0
+    camera_pixel_size_um: float = 0.0
+    flip_fits_vertical: bool = True
     reconnect_interval_s: int = 5
     logging_level: str = "INFO"
     image_stretch_level: int = 50
@@ -98,6 +102,9 @@ class PersistentSettings:
             app_epoch=str(data.get("app_epoch", DEFAULT_EPOCH)),
             astap_executable=str(data.get("astap_executable", SOLVER_CONFIG.astap_executable)),
             astap_downsize_factor=max(1, int(data.get("astap_downsize_factor", 1))),
+            finder_focal_length_mm=max(0, int(data.get("finder_focal_length_mm", 0))),
+            camera_pixel_size_um=max(0.0, float(data.get("camera_pixel_size_um", 0.0))),
+            flip_fits_vertical=bool(data.get("flip_fits_vertical", True)),
             reconnect_interval_s=max(5, int(data.get("reconnect_interval_s", 5))),
             logging_level=str(data.get("logging_level", "INFO")).upper(),
             image_stretch_level=min(100, max(0, int(data.get("image_stretch_level", 50)))),
@@ -122,6 +129,9 @@ class PersistentSettings:
             "app_epoch": self.app_epoch,
             "astap_executable": self.astap_executable,
             "astap_downsize_factor": self.astap_downsize_factor,
+            "finder_focal_length_mm": self.finder_focal_length_mm,
+            "camera_pixel_size_um": self.camera_pixel_size_um,
+            "flip_fits_vertical": self.flip_fits_vertical,
             "reconnect_interval_s": self.reconnect_interval_s,
             "logging_level": self.logging_level,
             "image_stretch_level": self.image_stretch_level,
@@ -305,6 +315,37 @@ class _ZoomableImageView(QtWidgets.QGraphicsView):
         scene_center = self.mapToScene(vp_rect.center())
         text_rect = self._text_item.boundingRect()
         self._text_item.setPos(scene_center.x() - text_rect.width() / 2, scene_center.y() - text_rect.height() / 2)
+
+
+class _Toast(QtWidgets.QWidget):
+    def __init__(self, parent: QtWidgets.QWidget, message: str, duration_ms: int = 3500) -> None:
+        super().__init__(parent, QtCore.Qt.WindowType.ToolTip)
+        self.setAttribute(QtCore.Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        self.setAttribute(QtCore.Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
+        self.setWindowFlags(
+            QtCore.Qt.WindowType.FramelessWindowHint
+            | QtCore.Qt.WindowType.ToolTip
+            | QtCore.Qt.WindowType.WindowStaysOnTopHint
+        )
+
+        label = QtWidgets.QLabel(message, self)
+        label.setWordWrap(True)
+        label.setStyleSheet(
+            "QLabel {"
+            "background-color: rgba(30, 30, 30, 220);"
+            "color: #f6f6f6;"
+            "border-radius: 8px;"
+            "padding: 10px 12px;"
+            "font-size: 12px;"
+            "}"
+        )
+
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.addWidget(label)
+
+        self.adjustSize()
+        QtCore.QTimer.singleShot(duration_ms, self.close)
 
 
 class TelescopeSettingsDialog(QtWidgets.QDialog):
@@ -567,10 +608,16 @@ class CameraSettingsDialog(QtWidgets.QDialog):
 
 
 class AppSettingsDialog(QtWidgets.QDialog):
-    def __init__(self, settings: PersistentSettings, parent: QtWidgets.QWidget | None = None) -> None:
+    def __init__(
+        self,
+        settings: PersistentSettings,
+        image_height_px: int | None = None,
+        parent: QtWidgets.QWidget | None = None,
+    ) -> None:
         super().__init__(parent)
         self.setWindowTitle("App Settings")
-        self.resize(520, 300)
+        self.resize(560, 360)
+        self._image_height_px = image_height_px
 
         self._epoch = QtWidgets.QComboBox()
         self._epoch.addItems(["J2000", "JNOW"])
@@ -581,6 +628,27 @@ class AppSettingsDialog(QtWidgets.QDialog):
         self._astap_downsize = QtWidgets.QSpinBox()
         self._astap_downsize.setRange(1, 8)
         self._astap_downsize.setValue(max(1, settings.astap_downsize_factor))
+
+        self._finder_focal_length = QtWidgets.QSpinBox()
+        self._finder_focal_length.setRange(0, 5000)
+        self._finder_focal_length.setSingleStep(1)
+        self._finder_focal_length.setSuffix(" mm")
+        self._finder_focal_length.setValue(max(0, int(settings.finder_focal_length_mm)))
+        self._finder_focal_length.setToolTip("Finder scope focal length in millimeters. Set to 0 to disable FOV hinting.")
+
+        self._camera_pixel_size = QtWidgets.QDoubleSpinBox()
+        self._camera_pixel_size.setRange(0.0, 20.0)
+        self._camera_pixel_size.setDecimals(2)
+        self._camera_pixel_size.setSingleStep(0.1)
+        self._camera_pixel_size.setSuffix(" um")
+        self._camera_pixel_size.setValue(max(0.0, float(settings.camera_pixel_size_um)))
+        self._camera_pixel_size.setToolTip("Camera pixel size in microns. Set to 0 to disable FOV hinting.")
+
+        self._flip_fits = QtWidgets.QCheckBox("Flip FITS vertically to match app view")
+        self._flip_fits.setChecked(bool(settings.flip_fits_vertical))
+
+        self._fov_label = QtWidgets.QLabel()
+        self._update_fov_label()
         self._reconnect = QtWidgets.QSpinBox()
         self._reconnect.setRange(5, 30)
         self._reconnect.setSuffix(" s")
@@ -613,28 +681,57 @@ class AppSettingsDialog(QtWidgets.QDialog):
         grid.addWidget(self._astap, 1, 1)
         grid.addWidget(QtWidgets.QLabel("ASTAP downsize factor"), 2, 0)
         grid.addWidget(self._astap_downsize, 2, 1)
-        grid.addWidget(QtWidgets.QLabel("Reconnect interval"), 3, 0)
-        grid.addWidget(self._reconnect, 3, 1)
-        grid.addWidget(QtWidgets.QLabel("Observatory latitude"), 4, 0)
-        grid.addWidget(self._observatory_latitude, 4, 1)
-        grid.addWidget(QtWidgets.QLabel("Observatory longitude"), 5, 0)
-        grid.addWidget(self._observatory_longitude, 5, 1)
-        grid.addWidget(QtWidgets.QLabel("Logging level"), 6, 0)
-        grid.addWidget(self._logging_level, 6, 1)
+        grid.addWidget(QtWidgets.QLabel("Finder focal length"), 3, 0)
+        grid.addWidget(self._finder_focal_length, 3, 1)
+        grid.addWidget(QtWidgets.QLabel("Camera pixel size"), 4, 0)
+        grid.addWidget(self._camera_pixel_size, 4, 1)
+        grid.addWidget(QtWidgets.QLabel("Computed FOV (vertical)"), 5, 0)
+        grid.addWidget(self._fov_label, 5, 1)
+        grid.addWidget(self._flip_fits, 6, 0, 1, 2)
+        grid.addWidget(QtWidgets.QLabel("Reconnect interval"), 7, 0)
+        grid.addWidget(self._reconnect, 7, 1)
+        grid.addWidget(QtWidgets.QLabel("Observatory latitude"), 8, 0)
+        grid.addWidget(self._observatory_latitude, 8, 1)
+        grid.addWidget(QtWidgets.QLabel("Observatory longitude"), 9, 0)
+        grid.addWidget(self._observatory_longitude, 9, 1)
+        grid.addWidget(QtWidgets.QLabel("Logging level"), 10, 0)
+        grid.addWidget(self._logging_level, 10, 1)
 
         row = QtWidgets.QHBoxLayout()
         row.addStretch(1)
         row.addWidget(cancel)
         row.addWidget(save)
-        grid.addLayout(row, 7, 0, 1, 2)
+        grid.addLayout(row, 12, 0, 1, 2)
 
         save.clicked.connect(self.accept)
         cancel.clicked.connect(self.reject)
+
+        self._finder_focal_length.valueChanged.connect(self._update_fov_label)
+        self._camera_pixel_size.valueChanged.connect(self._update_fov_label)
+
+    def _update_fov_label(self) -> None:
+        focal_length_mm = float(self._finder_focal_length.value())
+        pixel_size_um = float(self._camera_pixel_size.value())
+
+        if self._image_height_px is None or self._image_height_px <= 0:
+            self._fov_label.setText("Unavailable (no frame height)")
+            return
+
+        if focal_length_mm <= 0 or pixel_size_um <= 0:
+            self._fov_label.setText("Unavailable (set focal length + pixel size)")
+            return
+
+        sensor_height_mm = (pixel_size_um * self._image_height_px) / 1000.0
+        fov_deg = math.degrees(2.0 * math.atan(sensor_height_mm / (2.0 * focal_length_mm)))
+        self._fov_label.setText(f"{fov_deg:.3f} deg")
 
     def apply_to(self, settings: PersistentSettings) -> None:
         settings.app_epoch = self._epoch.currentText()
         settings.astap_executable = self._astap.text().strip() or SOLVER_CONFIG.astap_executable
         settings.astap_downsize_factor = max(1, int(self._astap_downsize.value()))
+        settings.finder_focal_length_mm = max(0, int(self._finder_focal_length.value()))
+        settings.camera_pixel_size_um = max(0.0, float(self._camera_pixel_size.value()))
+        settings.flip_fits_vertical = self._flip_fits.isChecked()
         settings.reconnect_interval_s = int(self._reconnect.value())
         settings.observatory_latitude_deg = float(self._observatory_latitude.value())
         settings.observatory_longitude_deg = float(self._observatory_longitude.value())
@@ -662,6 +759,16 @@ class MainWindow(QtWidgets.QMainWindow):
             astap_executable=self._settings.astap_executable,
             downsample_factor=self._settings.astap_downsize_factor,
             approximate_coords_provider=self._astap_hint_coordinates,
+            finder_focal_length_mm=(
+                self._settings.finder_focal_length_mm
+                if self._settings.finder_focal_length_mm > 0
+                else None
+            ),
+            camera_pixel_size_um=(
+                self._settings.camera_pixel_size_um
+                if self._settings.camera_pixel_size_um > 0
+                else None
+            ),
         )
 
         self._latest_frame: Frame | None = None
@@ -676,6 +783,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self._telescope_connect_thread: QtCore.QThread | None = None
         self._telescope_connect_worker: _TelescopeConnectWorker | None = None
         self._telescope_connect_in_progress = False
+        self._toast: _Toast | None = None
+        self._pending_toast_message: str | None = None
+        self._pending_fits_save_path: Path | None = None
 
         self._sample_image_path = self._resolve_sample_image_path(SOLVER_CONFIG.astap_test_image)
 
@@ -784,17 +894,20 @@ class MainWindow(QtWidgets.QMainWindow):
         self._camera_settings_btn = QtWidgets.QPushButton("Camera Settings")
         self._app_settings_btn = QtWidgets.QPushButton("App Settings")
         self._test_solve_btn = QtWidgets.QPushButton("Test Plate Solve")
+        self._save_fits_btn = QtWidgets.QPushButton("Save Image as FITS")
         self._exit_btn = QtWidgets.QPushButton("Exit App")
         self._scope_settings_btn.clicked.connect(self._open_telescope_settings)
         self._camera_settings_btn.clicked.connect(self._open_camera_settings)
         self._app_settings_btn.clicked.connect(self._open_app_settings)
         self._test_solve_btn.clicked.connect(self._test_plate_solve)
+        self._save_fits_btn.clicked.connect(self._request_save_fits)
         self._exit_btn.clicked.connect(self._exit_app)
 
         bottom_row.addWidget(self._scope_settings_btn)
         bottom_row.addWidget(self._camera_settings_btn)
         bottom_row.addWidget(self._app_settings_btn)
         bottom_row.addWidget(self._test_solve_btn)
+        bottom_row.addWidget(self._save_fits_btn)
         bottom_row.addStretch(1)
         bottom_row.addWidget(self._exit_btn)
 
@@ -854,6 +967,113 @@ class MainWindow(QtWidgets.QMainWindow):
         if len(compact) <= max_len:
             return compact
         return f"{compact[: max_len - 3]}..."
+
+    def _show_toast(self, message: str, duration_ms: int = 3500) -> None:
+        if not self.isVisible() or self.isMinimized():
+            self._pending_toast_message = message
+            return
+
+        if self._toast is not None:
+            try:
+                self._toast.close()
+            except Exception:
+                pass
+
+        self._toast = _Toast(self, message, duration_ms=duration_ms)
+        self._toast.adjustSize()
+
+        margin = 16
+        parent_rect = self.rect()
+        pos = self.mapToGlobal(
+            QtCore.QPoint(
+                max(margin, parent_rect.width() - self._toast.width() - margin),
+                max(margin, parent_rect.height() - self._toast.height() - margin),
+            )
+        )
+        self._toast.move(pos)
+        self._toast.show()
+
+    def _flush_pending_toast(self) -> None:
+        if self._pending_toast_message:
+            message = self._pending_toast_message
+            self._pending_toast_message = None
+            self._show_toast(message)
+
+    def _request_save_fits(self) -> None:
+        if self._camera is None and self._settings.camera_selected != "simulator":
+            QtWidgets.QMessageBox.warning(self, "No Camera", "Connect a camera to capture a FITS image.")
+            return
+
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+        default_name = f"digital_finder_{stamp}.fits"
+        start_dir = str(self._settings_path.parent)
+        path_text, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self,
+            "Save Image as FITS",
+            str(Path(start_dir) / default_name),
+            "FITS files (*.fits *.fit *.fts)",
+        )
+        if not path_text:
+            return
+
+        path = Path(path_text)
+        if path.suffix.lower() not in {".fits", ".fit", ".fts"}:
+            path = path.with_suffix(".fits")
+
+        self._pending_fits_save_path = path
+        self._show_toast(f"Will save next frame to {path.name}")
+
+        if not self._capture_in_progress and self._camera is not None:
+            self._capture_latest_frame()
+
+    def _maybe_save_pending_fits(self, frame: Frame) -> None:
+        if self._pending_fits_save_path is None:
+            return
+
+        path = self._pending_fits_save_path
+        self._pending_fits_save_path = None
+
+        data = np.asarray(frame.data)
+        if data.ndim > 2:
+            logger.warning("FITS save: converting %sD frame to 2D by taking first plane.", data.ndim)
+            data = np.asarray(data[0])
+
+        if self._settings.flip_fits_vertical:
+            data = np.flipud(data)
+
+        header = fits.Header()
+        header["CREATOR"] = "Digital Finder"
+        header["DATE-OBS"] = frame.captured_at_utc
+        header["EXPTIME"] = round(self._settings.camera_exposure_ms / 1000.0, 6)
+        header["GAIN"] = int(self._settings.camera_gain)
+        header["BINNING"] = int(self._settings.camera_binning)
+        header["CAMSEL"] = self._settings.camera_selected
+        if self._settings.zwo_camera_name:
+            header["CAMNAME"] = self._settings.zwo_camera_name
+        if self._settings.camera_data_type:
+            header["DATATYPE"] = self._settings.camera_data_type
+        if self._settings.camera_pixel_size_um > 0:
+            header["PIXSIZE"] = float(self._settings.camera_pixel_size_um)
+        if self._settings.finder_focal_length_mm > 0:
+            header["FOCALLEN"] = int(self._settings.finder_focal_length_mm)
+
+        if self._telescope is not None:
+            try:
+                if self._telescope.is_connected():
+                    coords = self._telescope.get_coordinates(timeout_s=1.0)
+                    header["TELRA"] = float(coords.ra_deg)
+                    header["TELDEC"] = float(coords.dec_deg)
+                    header["TELEPOC"] = coords.epoch
+            except Exception:  # noqa: BLE001
+                pass
+
+        try:
+            fits.PrimaryHDU(data, header=header).writeto(path, overwrite=True)
+            logger.info("Saved FITS image: %s", path)
+            self._show_toast(f"Saved FITS image: {path.name}")
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("Failed to save FITS image")
+            QtWidgets.QMessageBox.warning(self, "Save Failed", str(exc))
 
     def _apply_retry_interval(self) -> None:
         interval_ms = int(max(5, self._settings.reconnect_interval_s) * 1000)
@@ -1064,6 +1284,14 @@ class MainWindow(QtWidgets.QMainWindow):
                 return
 
             self._apply_camera_settings_to_backend()
+
+            if selected == "zwo" and isinstance(self._camera, ZwoCameraClient):
+                pixel_size_um = self._camera.get_pixel_size_um()
+                if pixel_size_um is not None:
+                    self._settings.camera_pixel_size_um = float(pixel_size_um)
+                    self._save_settings()
+                    logger.info("ZWO camera pixel size detected: %.3f um", pixel_size_um)
+                    self._show_toast(f"ZWO pixel size detected: {pixel_size_um:.2f} um")
         except Exception as exc:  # noqa: BLE001
             self._camera_last_error = str(exc)
             self._disconnect_camera()
@@ -1114,7 +1342,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self._refresh_status_lines()
 
     def _open_app_settings(self) -> None:
-        dialog = AppSettingsDialog(self._settings, self)
+        image_height_px: int | None = None
+        if self._latest_frame is not None and isinstance(self._latest_frame.data, np.ndarray):
+            if self._latest_frame.data.ndim >= 2:
+                image_height_px = int(self._latest_frame.data.shape[0])
+
+        dialog = AppSettingsDialog(self._settings, image_height_px=image_height_px, parent=self)
         if dialog.exec() != QtWidgets.QDialog.DialogCode.Accepted:
             return
 
@@ -1125,6 +1358,16 @@ class MainWindow(QtWidgets.QMainWindow):
             astap_executable=self._settings.astap_executable,
             downsample_factor=self._settings.astap_downsize_factor,
             approximate_coords_provider=self._astap_hint_coordinates,
+            finder_focal_length_mm=(
+                self._settings.finder_focal_length_mm
+                if self._settings.finder_focal_length_mm > 0
+                else None
+            ),
+            camera_pixel_size_um=(
+                self._settings.camera_pixel_size_um
+                if self._settings.camera_pixel_size_um > 0
+                else None
+            ),
         )
         self._apply_retry_interval()
         self._save_settings()
@@ -1163,6 +1406,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def showEvent(self, event: QtGui.QShowEvent) -> None:
         super().showEvent(event)
         self._sync_live_loop_timer(capture_immediately=True)
+        self._flush_pending_toast()
 
     def hideEvent(self, event: QtGui.QHideEvent) -> None:
         self._sync_live_loop_timer()
@@ -1209,6 +1453,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if not isinstance(frame, Frame):
             return
 
+        self._maybe_save_pending_fits(frame)
         self._latest_frame = frame
         self._render_frame(frame)
         self._refresh_status_lines()
@@ -1342,7 +1587,7 @@ class MainWindow(QtWidgets.QMainWindow):
         dialog = AlignmentWizardDialog(
             telescope=self._telescope,
             solver=self._solver,
-            frame_provider=self._capture_fresh_alignment_frame,
+            frame_provider=self._capture_alignment_frame_background,
             epoch=self._epoch,
             observatory_latitude_deg=self._settings.observatory_latitude_deg,
             observatory_longitude_deg=self._settings.observatory_longitude_deg,
@@ -1388,10 +1633,36 @@ class MainWindow(QtWidgets.QMainWindow):
             time.sleep(0.01)
 
         frame = self._capture_frame_sync()
+        self._maybe_save_pending_fits(frame)
         self._latest_frame = frame
         self._render_frame(frame)
         self._refresh_status_lines()
         return frame
+
+    def _capture_alignment_frame_background(self) -> Frame:
+        if self._camera is None:
+            raise RuntimeError("Camera is not configured")
+
+        if self._capture_in_progress:
+            deadline = time.monotonic() + TIMEOUTS.camera_capture_s + 2.0
+            while self._capture_in_progress and time.monotonic() < deadline:
+                time.sleep(0.05)
+            if self._capture_in_progress:
+                raise TimeoutError("Timed out waiting for ongoing capture to finish")
+
+        if self._telescope is not None and self._telescope.is_slewing():
+            raise RuntimeError("Telescope is still moving")
+
+        settle_deadline = time.monotonic() + TIMEOUTS.alignment_settle_s
+        while time.monotonic() < settle_deadline:
+            if self._telescope is not None and self._telescope.is_slewing():
+                raise RuntimeError("Telescope moved during settle time")
+            time.sleep(0.05)
+
+        if self._settings.camera_selected == "simulator" and self._sample_image_path.exists():
+            return self._load_sample_frame()
+
+        return self._camera.capture_frame(timeout_s=TIMEOUTS.camera_capture_s)
 
     def _align_telescope(self) -> None:
         if self._telescope is None or self._solver is None:
@@ -1435,6 +1706,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 return
             self._latest_frame = frame
             self._render_frame(frame)
+            self._maybe_save_pending_fits(frame)
 
         solve = self._solver.solve(frame, timeout_s=TIMEOUTS.plate_solve_s)
         self._latest_solve = solve
@@ -1564,8 +1836,20 @@ class MainWindow(QtWidgets.QMainWindow):
                     return
                 self._latest_frame = frame
                 self._render_frame(frame)
+                self._maybe_save_pending_fits(frame)
 
-            solve = self._solver.solve(frame, timeout_s=TIMEOUTS.plate_solve_s)
+            hint_coords: Coordinates | None = None
+            if self._telescope is not None:
+                try:
+                    if self._telescope.is_connected():
+                        hint_coords = self._telescope.get_coordinates(timeout_s=1.0)
+                except Exception:  # noqa: BLE001
+                    hint_coords = None
+
+            if hint_coords is not None and isinstance(self._solver, AstapPlateSolver):
+                solve = self._solver.solve_with_hint(frame, timeout_s=TIMEOUTS.plate_solve_s, hint=hint_coords)
+            else:
+                solve = self._solver.solve(frame, timeout_s=TIMEOUTS.plate_solve_s)
             self._latest_solve = solve
             self._refresh_status_lines()
 
@@ -1756,6 +2040,25 @@ def run() -> int:
     logger.info("Starting application")
 
     app = QtWidgets.QApplication(sys.argv)
+    app.setStyle("Fusion")
+    dark_palette = QtGui.QPalette()
+    dark_palette.setColor(QtGui.QPalette.ColorRole.Window, QtGui.QColor(20, 20, 20))
+    dark_palette.setColor(QtGui.QPalette.ColorRole.WindowText, QtGui.QColor(230, 230, 230))
+    dark_palette.setColor(QtGui.QPalette.ColorRole.Base, QtGui.QColor(15, 15, 15))
+    dark_palette.setColor(QtGui.QPalette.ColorRole.AlternateBase, QtGui.QColor(25, 25, 25))
+    dark_palette.setColor(QtGui.QPalette.ColorRole.ToolTipBase, QtGui.QColor(20, 20, 20))
+    dark_palette.setColor(QtGui.QPalette.ColorRole.ToolTipText, QtGui.QColor(230, 230, 230))
+    dark_palette.setColor(QtGui.QPalette.ColorRole.Text, QtGui.QColor(230, 230, 230))
+    dark_palette.setColor(QtGui.QPalette.ColorRole.Button, QtGui.QColor(30, 30, 30))
+    dark_palette.setColor(QtGui.QPalette.ColorRole.ButtonText, QtGui.QColor(230, 230, 230))
+    dark_palette.setColor(QtGui.QPalette.ColorRole.BrightText, QtGui.QColor(255, 64, 64))
+    dark_palette.setColor(QtGui.QPalette.ColorRole.Highlight, QtGui.QColor(42, 130, 218))
+    dark_palette.setColor(QtGui.QPalette.ColorRole.HighlightedText, QtGui.QColor(20, 20, 20))
+    dark_palette.setColor(QtGui.QPalette.ColorRole.PlaceholderText, QtGui.QColor(140, 140, 140))
+    app.setPalette(dark_palette)
+    app.setStyleSheet(
+        "QToolTip { color: #e6e6e6; background-color: #1e1e1e; border: 1px solid #2a2a2a; }"
+    )
     app.setApplicationName(APP_NAME)
     app.setOrganizationName("Powell Observatory ASKC")
 

@@ -133,6 +133,24 @@ class ZwoCameraClient(CameraClient):
             raise ValueError("RGB24 mode is disabled in this app. Use RAW16 or MONO8.")
         self._settings.data_type = data_type
 
+    def get_pixel_size_um(self) -> float | None:
+        def _read(camera: ZWOCamera) -> float | None:
+            try:
+                info = pyzwoasi.getCameraProperty(self._settings.camera_index)
+            except Exception:  # noqa: BLE001
+                info = None
+
+            value = getattr(info, "PixelSize", None) if info is not None else getattr(camera, "_pixelSize", None)
+            if value is None:
+                return None
+            try:
+                size = float(value)
+            except (TypeError, ValueError):
+                return None
+            return size if size > 0 else None
+
+        return self._run_with_reconnect(_read)
+
     def _is_color_camera(self) -> bool:
         try:
             info = pyzwoasi.getCameraProperty(self._settings.camera_index)

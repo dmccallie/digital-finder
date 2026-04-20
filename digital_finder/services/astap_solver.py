@@ -28,41 +28,92 @@ class AstapPlateSolver(PlateSolver):
         astap_executable: str = "astap.exe",
         downsample_factor: int = 2,
         approximate_coords_provider: Callable[[], Coordinates | None] | None = None,
+        finder_focal_length_mm: float | None = None,
+        camera_pixel_size_um: float | None = None,
     ) -> None:
         self.astap_executable = astap_executable
         self.downsample_factor = max(1, int(downsample_factor))
         self._approximate_coords_provider = approximate_coords_provider
+        self._finder_focal_length_mm = finder_focal_length_mm
+        self._camera_pixel_size_um = camera_pixel_size_um
 
-    def _build_command(self, input_path: str, force_blind: bool = False) -> tuple[list[str], bool]:
+    def _build_command(
+        self,
+        input_path: str,
+        frame: Frame | None = None,
+        force_blind: bool = False,
+        hint_override: Coordinates | None = None,
+    ) -> tuple[list[str], bool]:
         command = [self.astap_executable, "-f", input_path]
+        fov_deg = self._estimate_fov_height_deg(frame)
+        fov_arg = f"{fov_deg:.6f}" if fov_deg is not None else "0"
+        if frame is not None and isinstance(frame.data, np.ndarray) and frame.data.ndim >= 2:
+            height_px = int(frame.data.shape[0])
+            width_px = int(frame.data.shape[1])
+            logger.info(
+                "ASTAP frame size %dx%d, computed FOV height=%s",
+                width_px,
+                height_px,
+                f"{fov_deg:.6f} deg" if fov_deg is not None else "auto",
+            )
+
+        # force debug - not very useful
+        # command.append("-debug")
 
         if force_blind:
             # ASTAP treats radius > 180 as full-sky blind search.
+            command.extend(["-fov", fov_arg])
             command.extend(["-r", "181"])
             return command, False
 
-        hint: Coordinates | None = None
-        if self._approximate_coords_provider is not None:
+        hint: Coordinates | None = hint_override
+        if hint is None and self._approximate_coords_provider is not None:
             try:
                 hint = self._approximate_coords_provider()
             except Exception:  # noqa: BLE001
                 hint = None
-
+    
         if hint is not None:
             ra_hours = (hint.ra_deg % 360.0) / 15.0
             command.extend([
                 "-ra",
                 f"{ra_hours:.6f}",
-                "-dec",
-                f"{hint.dec_deg:.6f}",
+                #ASTAP uses -spd for dec (spd = dec + 90)
+                "-spd",
+                f"{hint.dec_deg + 90:.6f}",
+                # set -fov (field height of image, degrees) to zero for auto mode
+                "-fov",
+                fov_arg,
                 "-r",
                 "20",
             ])
             return command, True
         else:
             # ASTAP treats radius > 180 as full-sky blind search.
+            command.extend(["-fov", fov_arg])
             command.extend(["-r", "181"])
             return command, False
+
+    def _estimate_fov_height_deg(self, frame: Frame | None) -> float | None:
+        if frame is None:
+            return None
+        if self._finder_focal_length_mm is None or self._camera_pixel_size_um is None:
+            return None
+
+        focal_length_mm = float(self._finder_focal_length_mm)
+        pixel_size_um = float(self._camera_pixel_size_um)
+        if focal_length_mm <= 0 or pixel_size_um <= 0:
+            return None
+
+        height_px: int | None = None
+        if isinstance(frame.data, np.ndarray) and frame.data.ndim >= 2:
+            height_px = int(frame.data.shape[0])
+
+        if height_px is None or height_px <= 0:
+            return None
+
+        sensor_height_mm = (pixel_size_um * height_px) / 1000.0
+        return math.degrees(2.0 * math.atan(sensor_height_mm / (2.0 * focal_length_mm)))
 
     def _log_astap_feedback(self, stage: str, completed: subprocess.CompletedProcess[str], input_path: str) -> None:
         stdout_text = (completed.stdout or "").strip()
@@ -338,6 +389,12 @@ class AstapPlateSolver(PlateSolver):
         )
 
     def solve(self, frame: Frame, timeout_s: float) -> SolveResult:
+        return self._solve_internal(frame, timeout_s, hint_override=None)
+
+    def solve_with_hint(self, frame: Frame, timeout_s: float, hint: Coordinates) -> SolveResult:
+        return self._solve_internal(frame, timeout_s, hint_override=hint)
+
+    def _solve_internal(self, frame: Frame, timeout_s: float, hint_override: Coordinates | None) -> SolveResult:
         temp_image_path: str | None = None
         input_path: str | None = None
 
@@ -352,16 +409,19 @@ class AstapPlateSolver(PlateSolver):
             input_path = frame.source_path
 
         if input_path is None:
+            logger.error("ASTAP solver requires frame.data array or valid frame.source_path")
             return SolveResult(success=False, message="ASTAP solver requires frame.data array or valid frame.source_path")
 
         try:
-            command, used_hint = self._build_command(input_path)
+            command, used_hint = self._build_command(input_path, frame=frame, hint_override=hint_override)
             logger.info("Running ASTAP command: %s", subprocess.list2cmdline(command))
             try:
                 completed = subprocess.run(command, capture_output=True, text=True, timeout=timeout_s, check=False)
             except subprocess.TimeoutExpired:
+                logger.warning("ASTAP solve timed out after %s seconds", timeout_s)
                 return SolveResult(success=False, message="ASTAP timed out")
             except FileNotFoundError:
+                logger.error("ASTAP executable not found: %s", self.astap_executable)
                 return SolveResult(
                     success=False,
                     message=(
@@ -370,6 +430,7 @@ class AstapPlateSolver(PlateSolver):
                     ),
                 )
             except OSError as exc:
+                logger.error("Failed to start ASTAP: %s", exc)
                 return SolveResult(success=False, message=f"Failed to start ASTAP: {exc}")
 
             self._log_astap_feedback("primary", completed, input_path)
@@ -378,7 +439,12 @@ class AstapPlateSolver(PlateSolver):
             needs_blind_retry = used_hint and (completed.returncode != 0 or coordinates is None)
 
             if needs_blind_retry:
-                blind_command, _ = self._build_command(input_path, force_blind=True)
+                blind_command, _ = self._build_command(
+                    input_path,
+                    frame=frame,
+                    force_blind=True,
+                    hint_override=hint_override,
+                )
                 logger.info(
                     "ASTAP hinted solve failed; retrying blind search command: %s",
                     subprocess.list2cmdline(blind_command),
@@ -392,8 +458,10 @@ class AstapPlateSolver(PlateSolver):
                         check=False,
                     )
                 except subprocess.TimeoutExpired:
+                    logger.warning("ASTAP blind retry timed out after %s seconds", timeout_s)
                     return SolveResult(success=False, message="ASTAP timed out")
                 except OSError as exc:
+                    logger.error("Failed to start ASTAP blind retry: %s", exc)
                     return SolveResult(success=False, message=f"Failed to start ASTAP blind retry: {exc}")
 
                 completed = blind_completed

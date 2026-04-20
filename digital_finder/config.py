@@ -11,7 +11,7 @@ class Timeouts:
     telescope_slew_max_s: float = 120.0
     alignment_settle_s: float = 5.0
     camera_capture_s: float = 8.0
-    plate_solve_s: float = 30.0
+    plate_solve_s: float = 60.0 # powell computer is slow...
 
 
 @dataclass(frozen=True)

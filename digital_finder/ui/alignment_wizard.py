@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 
-from PySide6 import QtCore, QtWidgets
+from PySide6 import QtCore, QtGui, QtWidgets
 
 from digital_finder.config import TIMEOUTS
 from digital_finder.models import (
@@ -19,9 +19,50 @@ from digital_finder.models import (
     wrap_ra_deg,
 )
 from digital_finder.services.interfaces import PlateSolver, TelescopeClient
+from digital_finder.services.astap_solver import AstapPlateSolver
 from digital_finder.stars import SAMPLE_CALIBRATION_STARS
 
 logger = logging.getLogger(__name__)
+
+
+class _SolveWorker(QtCore.QObject):
+    solved = QtCore.Signal(object, object, object)
+    failed = QtCore.Signal(str)
+    finished = QtCore.Signal()
+    progress = QtCore.Signal(str)
+
+    def __init__(self, telescope: TelescopeClient, solver: PlateSolver, frame_provider, star) -> None:
+        super().__init__()
+        self._telescope = telescope
+        self._solver = solver
+        self._frame_provider = frame_provider
+        self._star = star
+
+    @QtCore.Slot()
+    def run(self) -> None:
+        try:
+            self.progress.emit("Checking mount status...")
+            if self._telescope.is_slewing():
+                raise RuntimeError("Telescope is moving. Wait for motion to stop before solving.")
+
+            self.progress.emit("Reading mount coordinates...")
+            mount = self._telescope.get_coordinates(timeout_s=TIMEOUTS.telescope_command_s)
+            self.progress.emit("Capturing alignment frame...")
+            frame: Frame = self._frame_provider()
+            if self._telescope.is_slewing():
+                raise RuntimeError("Telescope moved during capture. Please try again.")
+
+            self.progress.emit("Solving alignment image...")
+            if isinstance(self._solver, AstapPlateSolver):
+                solve = self._solver.solve_with_hint(frame, timeout_s=TIMEOUTS.plate_solve_s, hint=mount)
+            else:
+                solve = self._solver.solve(frame, timeout_s=TIMEOUTS.plate_solve_s)
+
+            self.solved.emit(solve, mount, self._star)
+        except Exception as exc:  # noqa: BLE001
+            self.failed.emit(str(exc))
+        finally:
+            self.finished.emit()
 
 
 class AlignmentWizardDialog(QtWidgets.QDialog):
@@ -47,6 +88,17 @@ class AlignmentWizardDialog(QtWidgets.QDialog):
         self._observatory_latitude_deg = observatory_latitude_deg
         self._observatory_longitude_deg = observatory_longitude_deg
         self._calibration_record: CalibrationRecord | None = None
+        self._solve_thread: QtCore.QThread | None = None
+        self._solve_worker: _SolveWorker | None = None
+        self._solve_in_progress = False
+        self._solve_cancelled = False
+        self._cancel_requested = False
+        self._pending_close = False
+        self._pending_retry = False
+        self._solve_timeout_timer = QtCore.QTimer(self)
+        self._solve_timeout_timer.setSingleShot(True)
+        self._solve_attempts = 0
+        self._max_solve_attempts = 3
 
         self._status = QtWidgets.QLabel("Step 1: Select an alignment star.")
         self._status.setWordWrap(True)
@@ -87,8 +139,9 @@ class AlignmentWizardDialog(QtWidgets.QDialog):
         self._star_combo.currentIndexChanged.connect(self._on_star_changed)
         self._slew_btn.clicked.connect(self._on_slew)
         self._aligned_btn.clicked.connect(self._on_aligned)
-        self._close_btn.clicked.connect(self.reject)
+        self._close_btn.clicked.connect(self._request_cancel)
         self._slew_poll.timeout.connect(self._poll_slew)
+        self._solve_timeout_timer.timeout.connect(self._on_solve_timeout)
 
     @property
     def calibration_record(self) -> CalibrationRecord | None:
@@ -151,58 +204,77 @@ class AlignmentWizardDialog(QtWidgets.QDialog):
         star = self._selected_star()
         if star is None:
             return
+        self._solve_attempts = 0
+        self._start_solve_attempt(star)
 
-        self._status.setText("Step 4: Settle, then Plate Solve...")
+    def _request_cancel(self) -> None:
+        if not self._solve_in_progress:
+            self.reject()
+            return
+
+        self._cancel_requested = True
+        self._solve_cancelled = True
+        self._pending_close = True
         self._aligned_btn.setEnabled(False)
+        self._slew_btn.setEnabled(False)
+        self._close_btn.setEnabled(False)
+        self._status.setText("Cancelling solve... please wait.")
+
+    def _start_solve_attempt(self, star) -> None:
+        if self._solve_in_progress:
+            return
+
+        if self._solve_attempts >= self._max_solve_attempts:
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Alignment Aborted",
+                "Maximum solve attempts reached. Please try again later.",
+            )
+            self._aligned_btn.setEnabled(True)
+            return
+
+        self._solve_attempts += 1
+        self._solve_cancelled = False
+        self._solve_in_progress = True
+        self._cancel_requested = False
+        self._pending_retry = False
+        self._aligned_btn.setEnabled(False)
+        self._status.setText("Step 4: Settle, then Plate Solve...")
         QtWidgets.QApplication.processEvents(QtCore.QEventLoop.ProcessEventsFlag.AllEvents, 50)
 
-        while True:
-            try:
-                if self._telescope.is_slewing():
-                    raise RuntimeError("Telescope is moving. Wait for motion to stop before solving.")
+        self._solve_thread = QtCore.QThread(self)
+        self._solve_worker = _SolveWorker(self._telescope, self._solver, self._frame_provider, star)
+        self._solve_worker.moveToThread(self._solve_thread)
+        self._solve_thread.started.connect(self._solve_worker.run)
+        self._solve_worker.solved.connect(self._on_solve_complete)
+        self._solve_worker.failed.connect(self._on_solve_failed)
+        self._solve_worker.progress.connect(self._on_solve_progress)
+        self._solve_worker.finished.connect(self._on_solve_finished)
+        self._solve_worker.finished.connect(self._solve_thread.quit)
+        self._solve_worker.finished.connect(self._solve_worker.deleteLater)
+        self._solve_thread.finished.connect(self._solve_thread.deleteLater)
+        self._solve_thread.start()
 
-                mount = self._telescope.get_coordinates(timeout_s=TIMEOUTS.telescope_command_s)
-                frame: Frame = self._frame_provider()
-                if self._telescope.is_slewing():
-                    raise RuntimeError("Telescope moved during capture. Please try again.")
+        timeout_s = TIMEOUTS.camera_capture_s + TIMEOUTS.plate_solve_s + 10.0
+        self._solve_timeout_timer.start(int(timeout_s * 1000))
 
-                solve: SolveResult = self._solver.solve(frame, timeout_s=TIMEOUTS.plate_solve_s)
-            except Exception as exc:  # noqa: BLE001
-                logger.exception("Alignment action failed")
-                action = QtWidgets.QMessageBox.question(
-                    self,
-                    "Calibration Solve Error",
-                    f"{exc}\n\nTry another image?",
-                    QtWidgets.QMessageBox.StandardButton.Retry | QtWidgets.QMessageBox.StandardButton.Cancel,
-                    QtWidgets.QMessageBox.StandardButton.Retry,
-                )
-                if action == QtWidgets.QMessageBox.StandardButton.Retry:
-                    self._status.setText("Step 4: Settle, then Plate Solve...")
-                    continue
-                self._aligned_btn.setEnabled(True)
-                return
+    @QtCore.Slot(object, object, object)
+    def _on_solve_complete(self, solve: object, mount: object, star: object) -> None:
+        if self._solve_cancelled:
+            return
+        self._pending_retry = False
+        if not isinstance(solve, SolveResult) or not isinstance(mount, Coordinates):
+            self._handle_solve_error("Invalid solve response")
+            return
 
-            if not solve.success or solve.coordinates is None:
-                action = QtWidgets.QMessageBox.question(
-                    self,
-                    "Plate Solve Failed",
-                    f"{solve.message or 'Unknown solver error'}\n\nTry another image?",
-                    QtWidgets.QMessageBox.StandardButton.Retry | QtWidgets.QMessageBox.StandardButton.Cancel,
-                    QtWidgets.QMessageBox.StandardButton.Retry,
-                )
-                if action == QtWidgets.QMessageBox.StandardButton.Retry:
-                    self._status.setText("Step 4: Plate solving...")
-                    continue
-                self._aligned_btn.setEnabled(True)
-                return
+        if not solve.success or solve.coordinates is None:
+            self._handle_solve_error(solve.message or "Unknown solver error", retry_title="Plate Solve Failed")
+            return
 
-            finder = solve.coordinates
-            break
-
+        finder = solve.coordinates
         offset_ra = wrap_ra_deg(mount.ra_deg - finder.ra_deg)
         offset_dec = mount.dec_deg - finder.dec_deg
 
-        # Solve-to-star deltas are useful for alignment diagnostics.
         solved_minus_star_ra = wrap_ra_deg(finder.ra_deg - star.ra_deg)
         if solved_minus_star_ra > 180.0:
             solved_minus_star_ra -= 360.0
@@ -249,6 +321,82 @@ class AlignmentWizardDialog(QtWidgets.QDialog):
             f"{metrics_block}",
         )
         self.accept()
+
+    @QtCore.Slot(str)
+    def _on_solve_failed(self, message: str) -> None:
+        if self._solve_cancelled:
+            return
+        self._pending_retry = False
+        self._handle_solve_error(message or "Unknown solver error")
+
+    @QtCore.Slot(str)
+    def _on_solve_progress(self, message: str) -> None:
+        if self._solve_cancelled or self._cancel_requested:
+            return
+        if message:
+            self._status.setText(f"Step 4: {message}")
+
+    @QtCore.Slot()
+    def _on_solve_finished(self) -> None:
+        self._solve_in_progress = False
+        self._solve_timeout_timer.stop()
+        self._solve_worker = None
+        self._solve_thread = None
+        if self._pending_retry:
+            self._pending_retry = False
+            star = self._selected_star()
+            if star is not None:
+                self._start_solve_attempt(star)
+                return
+        if self._pending_close:
+            self._pending_close = False
+            self.reject()
+
+    def _on_solve_timeout(self) -> None:
+        if not self._solve_in_progress:
+            return
+        self._solve_cancelled = True
+        if self._cancel_requested:
+            return
+        action = QtWidgets.QMessageBox.question(
+            self,
+            "Solve Timeout",
+            "Alignment solve timed out. Try another image?",
+            QtWidgets.QMessageBox.StandardButton.Retry | QtWidgets.QMessageBox.StandardButton.Cancel,
+            QtWidgets.QMessageBox.StandardButton.Retry,
+        )
+        if action == QtWidgets.QMessageBox.StandardButton.Retry:
+            star = self._selected_star()
+            if star is not None:
+                self._pending_retry = True
+        else:
+            self._aligned_btn.setEnabled(True)
+
+    def _handle_solve_error(self, message: str, retry_title: str = "Calibration Solve Error") -> None:
+        logger.warning("Alignment action failed: %s", message)
+        if self._cancel_requested:
+            return
+        action = QtWidgets.QMessageBox.question(
+            self,
+            retry_title,
+            f"{message}\n\nTry another image?",
+            QtWidgets.QMessageBox.StandardButton.Retry | QtWidgets.QMessageBox.StandardButton.Cancel,
+            QtWidgets.QMessageBox.StandardButton.Retry,
+        )
+        if action == QtWidgets.QMessageBox.StandardButton.Retry:
+            self._status.setText("Step 4: Settle, then Plate Solve...")
+            star = self._selected_star()
+            if star is not None:
+                self._start_solve_attempt(star)
+            return
+        self._aligned_btn.setEnabled(True)
+
+    def closeEvent(self, event: QtGui.QCloseEvent) -> None:
+        if self._solve_in_progress:
+            self._request_cancel()
+            event.ignore()
+            return
+        super().closeEvent(event)
 
     def _format_altaz_text(self, ra_deg: float, dec_deg: float, precision: int = 3) -> str:
         try:
