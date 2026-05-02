@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import atexit
+import logging
 from dataclasses import dataclass
 from typing import Callable, TypeVar
 
@@ -11,6 +13,8 @@ from pyzwoasi.pyzwoasi import ASIImageType
 from digital_finder.models import Frame, now_utc_iso
 from digital_finder.services.camera_settings import CameraDataType, CameraSettings, ZwoCameraSettings
 from digital_finder.services.interfaces import CameraClient
+
+logger = logging.getLogger(__name__)
 
 T = TypeVar("T")
 
@@ -44,12 +48,21 @@ class ZwoCameraClient(CameraClient):
         self._settings = settings or ZwoCameraSettings()
         self._camera: ZWOCamera | None = None
         self._connect()
+        # Register cleanup so the SDK releases the camera on interpreter shutdown
+        # (e.g. VS Code debug stop / Ctrl+C), not just on normal Qt close.
+        atexit.register(self.close)
 
     def _connect(self) -> None:
         if self._camera is not None and not getattr(self._camera, "_isClosed", False):
             return
         if pyzwoasi.getNumOfConnectedCameras() <= self._settings.camera_index:
             raise RuntimeError("Requested ZWO camera index is not connected")
+        # Defensively close before opening in case a previous connection attempt
+        # (in this process) left the SDK handle in an inconsistent state.
+        try:
+            pyzwoasi.closeCamera(self._settings.camera_index)
+        except Exception:  # noqa: BLE001
+            pass  # expected when camera was not already open
         self._camera = ZWOCamera(self._settings.camera_index)
 
     def _reopen(self) -> None:
@@ -64,15 +77,31 @@ class ZwoCameraClient(CameraClient):
         try:
             return action(camera)
         except Exception as exc:  # noqa: BLE001
+            # Null out the handle immediately so no further calls reach the SDK
+            # with a bad handle (avoids native crashes on USB disconnect).
+            self.close()
             if not self._is_camera_closed_error(exc):
-                raise
-            self._reopen()
+                # Not a clean SDK close — most likely a USB disconnect or
+                # device removal. Raise a clean, catchable IOError.
+                raise IOError(f"ZWO camera lost (USB disconnected?): {exc}") from exc
+            # SDK reported ASI_ERROR_CAMERA_CLOSED — try once to reopen.
+            try:
+                self._connect()
+            except Exception as reopen_exc:  # noqa: BLE001
+                raise IOError(f"ZWO camera could not reopen: {reopen_exc}") from reopen_exc
             camera = self._require_camera()
-            return action(camera)
+            try:
+                return action(camera)
+            except Exception as retry_exc:  # noqa: BLE001
+                self.close()
+                raise IOError(f"ZWO camera lost after reopen: {retry_exc}") from retry_exc
 
     def close(self) -> None:
         if self._camera is not None:
-            self._camera.close()
+            try:
+                self._camera.close()
+            except Exception:  # noqa: BLE001
+                pass  # Ignore SDK errors on close (e.g. camera already gone after USB disconnect)
             self._camera = None
 
     def __del__(self) -> None:
@@ -180,9 +209,18 @@ class ZwoCameraClient(CameraClient):
         if exposure_s > timeout_s:
             raise TimeoutError("ZWO capture timeout: exposure longer than timeout")
 
-        image = self._run_with_reconnect(
-            lambda camera: camera.shot(exposureTime_us=self._settings.exposure_ms * 1000, imageType=self._image_type())
-        )
+        try:
+            image = self._run_with_reconnect(
+                lambda camera: camera.shot(exposureTime_us=self._settings.exposure_ms * 1000, imageType=self._image_type())
+            )
+        except SystemExit:
+            # pyzwoasi.shot() calls exit() after 3 consecutive failed exposures.
+            # Intercept here before SystemExit can escape into PySide6's slot
+            # dispatcher, which would trigger a full Qt application shutdown.
+            logger.error("ZWO camera exposure failed 3 times; treating as camera lost")
+            self.close()
+            raise IOError("ZWO camera exposure failed 3 times (USB disconnected?)")
+
         if not isinstance(image, np.ndarray):
             image = np.asarray(image)
 
