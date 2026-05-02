@@ -70,3 +70,14 @@ python main.py
 - Log file path: user log directory via `platformdirs`.
 
 Both locations are platform-specific and suitable for Windows deployment.
+
+## build using pyinstaller
+- build it and create the release zip file, using:
+```
+uv run pyinstaller DigitalFinder.spec
+Compress-Archive -Path .\dist\DigitalFinder\* -DestinationPath .\dist\DigitalFinder-windows-x64-v0.1.6.zip -Force 
+```
+- create a new tag to match v0.1.6 (for example)
+- go to github and create a release based on this tag
+- upload the zip to the release area
+
