@@ -158,6 +158,11 @@ class _CaptureWorker(QtCore.QObject):
             self.frame_ready.emit(frame)
         except Exception as exc:  # noqa: BLE001
             self.error.emit(str(exc))
+        except BaseException as exc:  # noqa: BLE001
+            # Safety belt: catch SystemExit / KeyboardInterrupt that somehow escaped
+            # capture_frame(). Emitting via the signal lets the main thread handle it
+            # gracefully instead of crashing the Qt slot dispatcher.
+            self.error.emit(f"Fatal capture error: {exc}")
         finally:
             self.finished.emit()
 
@@ -484,14 +489,14 @@ class CameraSettingsDialog(QtWidgets.QDialog):
         self._scan_btn = QtWidgets.QPushButton("Scan for Cameras")
 
         self._exp = QtWidgets.QSpinBox()
-        self._exp.setRange(50, 30_000)
-        self._exp.setSingleStep(250)
+        self._exp.setRange(1, 30_000)
         self._exp.setSuffix(" ms")
+        self._exp.setButtonSymbols(QtWidgets.QAbstractSpinBox.ButtonSymbols.NoButtons)
         self._exp.setValue(settings.camera_exposure_ms)
 
         self._gain = QtWidgets.QSpinBox()
         self._gain.setRange(0, 600)
-        self._gain.setSingleStep(50)
+        self._gain.setButtonSymbols(QtWidgets.QAbstractSpinBox.ButtonSymbols.NoButtons)
         self._gain.setValue(settings.camera_gain)
 
         self._binning = QtWidgets.QSpinBox()
@@ -1434,7 +1439,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self._capture_worker.error.connect(self._on_capture_worker_error)
         self._capture_worker.finished.connect(self._on_capture_worker_finished)
         self._capture_worker.finished.connect(self._capture_thread.quit)
-        self._capture_worker.finished.connect(self._capture_worker.deleteLater)
+        # Note: worker.deleteLater() is called from _on_capture_worker_finished (main
+        # thread) rather than directly here.  A direct connection would fire in the
+        # worker thread and race with Python GC dropping the reference from the main
+        # thread, causing "QObject::~QObject: Timers cannot be stopped from another
+        # thread" warnings.
         self._capture_thread.finished.connect(self._capture_thread.deleteLater)
 
         self._capture_thread.start()
@@ -1461,11 +1470,28 @@ class MainWindow(QtWidgets.QMainWindow):
     @QtCore.Slot(str)
     def _on_capture_worker_error(self, message: str) -> None:
         logger.error("Capture failed: %s", message)
+        # If the camera is no longer connected (e.g. USB unplugged), tear down the
+        # dead client and let the retry timer reconnect it.  Without this the live
+        # timer would hammer a bad SDK handle on every subsequent tick.
+        if self._camera is not None and not self._camera.is_connected():
+            logger.warning("Camera became unresponsive after capture error; disconnecting")
+            self._camera_last_error = message
+            self._disconnect_camera()
+            self._sync_live_loop_timer()
+            if self._settings.camera_selected != "none":
+                self._camera_retry_timer.start()
+            self._refresh_status_lines()
 
     @QtCore.Slot()
     def _on_capture_worker_finished(self) -> None:
         self._capture_in_progress = False
-        self._capture_worker = None
+        # Schedule deletion from the main thread so Qt processes it in the correct
+        # thread context (the worker thread drains its event queue before quitting).
+        # Do NOT set self._capture_worker = None first; keep the Python reference
+        # alive until deleteLater has been posted, preventing premature GC.
+        if self._capture_worker is not None:
+            self._capture_worker.deleteLater()
+            self._capture_worker = None
         self._capture_thread = None
 
     def _wait_for_capture_finish(self) -> bool:
@@ -1867,6 +1893,14 @@ class MainWindow(QtWidgets.QMainWindow):
             if metrics_text:
                 details = f"{details}\n\n{metrics_text}"
 
+            # Derive focal length from plate scale + known pixel size.
+            # f(mm) = pixel_size(µm) × 206.265 / image_scale("/px)
+            pixel_um = self._settings.camera_pixel_size_um
+            scale = solve.metrics.image_scale_arcsec_per_px if solve.metrics else None
+            if pixel_um and pixel_um > 0 and scale and scale > 0:
+                focal_mm = pixel_um * 206.265 / scale
+                details = f"{details}\nDerived focal length: {focal_mm:.1f} mm"
+
             QtWidgets.QMessageBox.information(
                 self,
                 "Plate Solve Success",
@@ -2040,6 +2074,19 @@ def run() -> int:
     logger.info("Starting application")
 
     app = QtWidgets.QApplication(sys.argv)
+
+    # Prevent a second instance from launching and fighting over the ZWO camera.
+    # QSharedMemory is released automatically by the OS if the process crashes.
+    _single_instance_guard = QtCore.QSharedMemory("DigitalFinder_SingleInstance")
+    if not _single_instance_guard.create(1):
+        logger.warning("Another instance is already running; exiting.")
+        QtWidgets.QMessageBox.warning(
+            None,
+            "Already Running",
+            f"{APP_NAME} is already running.\n\nOnly one instance may use the camera at a time.",
+        )
+        return 1
+
     app.setStyle("Fusion")
     dark_palette = QtGui.QPalette()
     dark_palette.setColor(QtGui.QPalette.ColorRole.Window, QtGui.QColor(20, 20, 20))
