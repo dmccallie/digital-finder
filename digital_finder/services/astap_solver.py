@@ -386,6 +386,10 @@ class AstapPlateSolver(PlateSolver):
             rotation_deg=rotation_deg,
             fov_width_deg=fov_width_deg,
             fov_height_deg=fov_height_deg,
+            cd1_1=cd11,
+            cd1_2=cd12,
+            cd2_1=cd21,
+            cd2_2=cd22,
         )
 
     def solve(self, frame: Frame, timeout_s: float) -> SolveResult:

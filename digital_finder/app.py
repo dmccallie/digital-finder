@@ -36,27 +36,34 @@ from digital_finder.logging_setup import configure_logging
 from digital_finder.models import (
     Coordinates,
     Frame,
+    PreviewWcsReference,
     SolveResult,
+    calibration_preview_source_offset_px,
     clamp_dec_deg,
     format_dec_deg_with_dms,
     format_horizontal_deg,
     format_plate_solve_metrics,
     format_ra_deg_with_hms,
     now_utc_iso,
+    preview_wcs_reference_is_valid,
     radec_to_horizontal,
+    shift_preview_image,
     wrap_ra_deg,
 )
 from digital_finder.services.alpaca_telescope import AlpacaTelescopeClient, DiscoveredTelescope, discover_alpaca_telescopes
 from digital_finder.services.astap_solver import AstapPlateSolver
 from digital_finder.services.camera_settings import CameraDataType, ZwoCameraSettings
 from digital_finder.services.interfaces import CameraClient, PlateSolver, TelescopeClient
-from digital_finder.services.simulated import SimulatedCameraClient
+from digital_finder.services.simulated import SimulatedCameraClient, SimulatedPlateSolver
 from digital_finder.services.zwo_camera import ZwoCameraClient
 from digital_finder.storage import CalibrationStore
 from digital_finder.ui.alignment_wizard import AlignmentWizardDialog
 
 logger = logging.getLogger(__name__)
 USER_TIMEZONE = ZoneInfo("America/Chicago")
+PREVIEW_WCS_MAX_AGE_S = 600.0
+PREVIEW_WCS_MAX_RA_DRIFT_DEG = 5.0
+PREVIEW_WCS_MAX_DEC_DRIFT_DEG = 5.0
 
 
 @dataclass
@@ -760,24 +767,11 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self._telescope: TelescopeClient | None = None
         self._camera: CameraClient | None = None
-        self._solver: PlateSolver = AstapPlateSolver(
-            astap_executable=self._settings.astap_executable,
-            downsample_factor=self._settings.astap_downsize_factor,
-            approximate_coords_provider=self._astap_hint_coordinates,
-            finder_focal_length_mm=(
-                self._settings.finder_focal_length_mm
-                if self._settings.finder_focal_length_mm > 0
-                else None
-            ),
-            camera_pixel_size_um=(
-                self._settings.camera_pixel_size_um
-                if self._settings.camera_pixel_size_um > 0
-                else None
-            ),
-        )
+        self._solver: PlateSolver
 
         self._latest_frame: Frame | None = None
         self._latest_solve: SolveResult | None = None
+        self._preview_wcs_reference: PreviewWcsReference | None = None
 
         self._telescope_last_error: str | None = None
         self._camera_last_error: str | None = None
@@ -793,6 +787,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._pending_fits_save_path: Path | None = None
 
         self._sample_image_path = self._resolve_sample_image_path(SOLVER_CONFIG.astap_test_image)
+        self._rebuild_solver_backend()
 
         self._live_timer = QtCore.QTimer(self)
         self._live_timer.setInterval(2000)
@@ -861,6 +856,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self._image_view = _ZoomableImageView()
         self._image_view.setMinimumSize(640, 480)
         self._image_view.set_placeholder("No image")
+        self._shift_by_offset_checkbox = QtWidgets.QCheckBox("Shift by offset")
+        self._shift_by_offset_checkbox.setEnabled(False)
+        self._shift_by_offset_checkbox.setToolTip("Shift preview is unavailable until finder calibration is present and valid.")
+        self._shift_by_offset_checkbox.toggled.connect(self._on_shift_preview_toggled)
         self._image_stats_label = QtWidgets.QLabel("Min: - | Mean: - | Max: -")
         self._image_stats_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignLeft)
         self._image_stats_label.setWordWrap(False)
@@ -884,11 +883,13 @@ class MainWindow(QtWidgets.QMainWindow):
         stretch_row.addWidget(self._stretch_slider, 1)
         stretch_row.addWidget(self._reset_view_btn)
         image_layout.addWidget(self._image_view)
+        image_layout.addWidget(self._shift_by_offset_checkbox)
         image_layout.addWidget(self._image_stats_label)
         image_layout.addLayout(stretch_row)
         image_layout.setStretch(0, 1)
         image_layout.setStretch(1, 0)
         image_layout.setStretch(2, 0)
+        image_layout.setStretch(3, 0)
 
         body = QtWidgets.QHBoxLayout()
         body.addWidget(left_panel, 0)
@@ -1248,6 +1249,63 @@ class MainWindow(QtWidgets.QMainWindow):
             # If mount cannot report coordinates (e.g., not roughly aligned), use blind solve.
             return None
 
+    def _rebuild_solver_backend(self, clear_preview_wcs: bool = False) -> None:
+        if self._settings.camera_selected == "simulator" and not self._sample_image_path.exists():
+            self._solver = SimulatedPlateSolver()
+        else:
+            self._solver = AstapPlateSolver(
+                astap_executable=self._settings.astap_executable,
+                downsample_factor=self._settings.astap_downsize_factor,
+                approximate_coords_provider=self._astap_hint_coordinates,
+                finder_focal_length_mm=(
+                    self._settings.finder_focal_length_mm
+                    if self._settings.finder_focal_length_mm > 0
+                    else None
+                ),
+                camera_pixel_size_um=(
+                    self._settings.camera_pixel_size_um
+                    if self._settings.camera_pixel_size_um > 0
+                    else None
+                ),
+            )
+
+        if clear_preview_wcs:
+            self._preview_wcs_reference = None
+            self._latest_solve = None
+
+    def _current_preview_coordinates(self) -> Coordinates | None:
+        if self._latest_frame is not None and self._latest_frame.true_coords is not None:
+            return self._latest_frame.true_coords.normalized()
+        if self._telescope is None:
+            return None
+        try:
+            if not self._telescope.is_connected():
+                return None
+            return self._telescope.get_coordinates(timeout_s=1.0).normalized()
+        except Exception:  # noqa: BLE001
+            return None
+
+    def _active_preview_wcs_reference(self) -> PreviewWcsReference | None:
+        reference = self._preview_wcs_reference
+        if not preview_wcs_reference_is_valid(
+            reference,
+            self._current_preview_coordinates(),
+            max_age_s=PREVIEW_WCS_MAX_AGE_S,
+            max_ra_shift_deg=PREVIEW_WCS_MAX_RA_DRIFT_DEG,
+            max_dec_shift_deg=PREVIEW_WCS_MAX_DEC_DRIFT_DEG,
+        ):
+            return None
+        return reference
+
+    def _store_preview_wcs_reference(self, solve: SolveResult, captured_at_utc: str | None = None) -> None:
+        if not solve.success or solve.coordinates is None or solve.metrics is None:
+            return
+        self._preview_wcs_reference = PreviewWcsReference(
+            coordinates=solve.coordinates.normalized(),
+            metrics=solve.metrics,
+            captured_at_utc=captured_at_utc or now_utc_iso(),
+        )
+
     def _apply_camera_settings_to_backend(self) -> None:
         if self._camera is None:
             return
@@ -1283,7 +1341,11 @@ class MainWindow(QtWidgets.QMainWindow):
             if selected == "zwo":
                 self._camera = ZwoCameraClient(settings=ZwoCameraSettings(camera_index=self._settings.zwo_camera_index))
             elif selected == "simulator":
-                self._camera = SimulatedCameraClient(mount_provider=self._mount_provider, epoch=self._epoch)
+                self._camera = SimulatedCameraClient(
+                    mount_provider=self._mount_provider,
+                    epoch=self._epoch,
+                    sample_frame_provider=(self._load_sample_frame if self._sample_image_path.exists() else None),
+                )
             else:
                 self._camera = None
                 return
@@ -1334,6 +1396,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         dialog.apply_to(self._settings)
         self._save_settings()
+        self._rebuild_solver_backend(clear_preview_wcs=True)
 
         self._disconnect_camera()
         if self._settings.camera_selected == "none":
@@ -1359,21 +1422,7 @@ class MainWindow(QtWidgets.QMainWindow):
         dialog.apply_to(self._settings)
         self._apply_logging_level(self._settings.logging_level)
         self._epoch = self._settings.app_epoch
-        self._solver = AstapPlateSolver(
-            astap_executable=self._settings.astap_executable,
-            downsample_factor=self._settings.astap_downsize_factor,
-            approximate_coords_provider=self._astap_hint_coordinates,
-            finder_focal_length_mm=(
-                self._settings.finder_focal_length_mm
-                if self._settings.finder_focal_length_mm > 0
-                else None
-            ),
-            camera_pixel_size_um=(
-                self._settings.camera_pixel_size_um
-                if self._settings.camera_pixel_size_um > 0
-                else None
-            ),
-        )
+        self._rebuild_solver_backend(clear_preview_wcs=True)
         self._apply_retry_interval()
         self._save_settings()
         self._sync_live_loop_timer()
@@ -1452,9 +1501,6 @@ class MainWindow(QtWidgets.QMainWindow):
         if self._camera is None:
             raise RuntimeError("Camera is not configured")
 
-        if self._settings.camera_selected == "simulator" and self._sample_image_path.exists():
-            return self._load_sample_frame()
-
         return self._camera.capture_frame(timeout_s=TIMEOUTS.camera_capture_s)
 
     @QtCore.Slot(object)
@@ -1464,6 +1510,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self._maybe_save_pending_fits(frame)
         self._latest_frame = frame
+        self._latest_solve = None
         self._render_frame(frame)
         self._refresh_status_lines()
 
@@ -1513,11 +1560,71 @@ class MainWindow(QtWidgets.QMainWindow):
 
         stretched = self._stretch_image(data)
         stretched = self._apply_display_smoothing(stretched)
+        stretched = self._apply_preview_offset_shift(stretched)
         h, w = stretched.shape
         qimg = QtGui.QImage(stretched.data, w, h, w, QtGui.QImage.Format.Format_Grayscale8).copy()
         pixmap = QtGui.QPixmap.fromImage(qimg)
         self._image_view.set_pixmap(pixmap)
         self._update_image_stats(data)
+
+    def _preview_shift_state(self, manual_invalidated: bool | None = None) -> tuple[bool, str | None, float | None, float | None]:
+        if manual_invalidated is None:
+            manual_invalidated = self._store.is_manual_invalidated()
+        if self._latest_calibration is None or manual_invalidated:
+            return False, None, None, None
+        return (
+            True,
+            self._latest_calibration.timestamp_utc,
+            self._latest_calibration.offset_ra_deg,
+            self._latest_calibration.offset_dec_deg,
+        )
+
+    def _update_shift_preview_checkbox(self, manual_invalidated: bool | None = None) -> None:
+        calibration_ready, _timestamp, _offset_ra, _offset_dec = self._preview_shift_state(manual_invalidated)
+        self._shift_by_offset_checkbox.setEnabled(calibration_ready)
+        if not calibration_ready:
+            self._shift_by_offset_checkbox.setToolTip("Shift preview is unavailable until finder calibration is present and valid.")
+            return
+
+        source_offset = self._current_preview_source_offset(manual_invalidated)
+        if source_offset is None:
+            self._shift_by_offset_checkbox.setToolTip(
+                "Shift the preview by the current finder calibration. Seed it with a plate solve or finder calibration; the cached matrix expires after about 10 minutes or a mount move larger than 5 degrees."
+            )
+            return
+
+        shift_x_px = int(round(source_offset[0]))
+        shift_y_px = int(round(source_offset[1]))
+        self._shift_by_offset_checkbox.setToolTip(
+            f"Shift the preview by the current finder calibration (~{shift_x_px:+d}px, {shift_y_px:+d}px)."
+        )
+
+    def _current_preview_source_offset(
+        self,
+        manual_invalidated: bool | None = None,
+    ) -> tuple[float, float] | None:
+        calibration_ready, _timestamp, _offset_ra, _offset_dec = self._preview_shift_state(manual_invalidated)
+        if not calibration_ready or not self._shift_by_offset_checkbox.isChecked():
+            return None
+
+        reference = self._active_preview_wcs_reference()
+        if reference is None:
+            return None
+
+        current_coordinates = self._current_preview_coordinates() or reference.coordinates
+        return calibration_preview_source_offset_px(current_coordinates, reference.metrics, self._latest_calibration)
+
+    def _apply_preview_offset_shift(self, image: np.ndarray) -> np.ndarray:
+        source_offset = self._current_preview_source_offset()
+        if source_offset is None:
+            return image
+        return shift_preview_image(image, source_offset[0], source_offset[1], fill_value=128)
+
+    @QtCore.Slot(bool)
+    def _on_shift_preview_toggled(self, _checked: bool) -> None:
+        self._update_shift_preview_checkbox()
+        if self._latest_frame is not None:
+            self._render_frame(self._latest_frame)
 
     def _apply_display_smoothing(self, stretched: np.ndarray) -> np.ndarray:
         # RAW Bayer-like frames can show checkerboard aliasing when displayed at reduced scale.
@@ -1629,6 +1736,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self._store.save_new(record)
         self._store.set_manual_invalidated(False)
         self._latest_calibration = record
+        if dialog.preview_solve_result is not None:
+            self._store_preview_wcs_reference(dialog.preview_solve_result, captured_at_utc=record.timestamp_utc)
         logger.info(
             "Finder calibration completed star=%s mount_ra=%.6f mount_dec=%.6f finder_ra=%.6f finder_dec=%.6f offset_ra=%.6f offset_dec=%.6f",
             record.star_name,
@@ -1639,6 +1748,7 @@ class MainWindow(QtWidgets.QMainWindow):
             record.offset_ra_deg,
             record.offset_dec_deg,
         )
+        self._update_shift_preview_checkbox(manual_invalidated=False)
         self._refresh_status_lines()
 
     def _capture_fresh_alignment_frame(self) -> Frame:
@@ -1661,6 +1771,7 @@ class MainWindow(QtWidgets.QMainWindow):
         frame = self._capture_frame_sync()
         self._maybe_save_pending_fits(frame)
         self._latest_frame = frame
+        self._latest_solve = None
         self._render_frame(frame)
         self._refresh_status_lines()
         return frame
@@ -1684,9 +1795,6 @@ class MainWindow(QtWidgets.QMainWindow):
             if self._telescope is not None and self._telescope.is_slewing():
                 raise RuntimeError("Telescope moved during settle time")
             time.sleep(0.05)
-
-        if self._settings.camera_selected == "simulator" and self._sample_image_path.exists():
-            return self._load_sample_frame()
 
         return self._camera.capture_frame(timeout_s=TIMEOUTS.camera_capture_s)
 
@@ -1731,11 +1839,16 @@ class MainWindow(QtWidgets.QMainWindow):
                 QtWidgets.QMessageBox.warning(self, "Capture Failed", str(exc))
                 return
             self._latest_frame = frame
+            self._latest_solve = None
             self._render_frame(frame)
             self._maybe_save_pending_fits(frame)
 
         solve = self._solver.solve(frame, timeout_s=TIMEOUTS.plate_solve_s)
         self._latest_solve = solve
+        self._store_preview_wcs_reference(solve, captured_at_utc=frame.captured_at_utc)
+        if solve.success and solve.coordinates is not None and self._latest_frame is frame:
+            self._render_frame(frame)
+        self._update_shift_preview_checkbox()
 
         if not solve.success or solve.coordinates is None:
             QtWidgets.QMessageBox.warning(self, "Plate Solve Failed", solve.message or "Unknown solver error")
@@ -1861,6 +1974,7 @@ class MainWindow(QtWidgets.QMainWindow):
                     QtWidgets.QMessageBox.warning(self, "Capture Failed", str(exc))
                     return
                 self._latest_frame = frame
+                self._latest_solve = None
                 self._render_frame(frame)
                 self._maybe_save_pending_fits(frame)
 
@@ -1877,6 +1991,10 @@ class MainWindow(QtWidgets.QMainWindow):
             else:
                 solve = self._solver.solve(frame, timeout_s=TIMEOUTS.plate_solve_s)
             self._latest_solve = solve
+            self._store_preview_wcs_reference(solve, captured_at_utc=frame.captured_at_utc)
+            if solve.success and solve.coordinates is not None and self._latest_frame is frame:
+                self._render_frame(frame)
+            self._update_shift_preview_checkbox()
             self._refresh_status_lines()
 
             if not solve.success or solve.coordinates is None:
@@ -1911,6 +2029,7 @@ class MainWindow(QtWidgets.QMainWindow):
             QtWidgets.QApplication.processEvents(QtCore.QEventLoop.ProcessEventsFlag.AllEvents, 50)
 
     def _refresh_status_lines(self) -> None:
+        prior_preview_state = self._preview_shift_state()
         telescope_connected = False
         if self._settings.telescope_selected is None:
             self._telescope_status.setText("Telescope: No telescope selected")
@@ -1992,6 +2111,7 @@ class MainWindow(QtWidgets.QMainWindow):
                     f"gain {self._settings.camera_gain} | {loop_state}"
                 )
 
+        manual_invalidated = self._store.is_manual_invalidated()
         self._latest_calibration = self._store.load_latest()
         if self._latest_calibration is None:
             self._calibration_status.setText("Finder Calibration: Not calibrated")
@@ -2003,6 +2123,10 @@ class MainWindow(QtWidgets.QMainWindow):
                 f"offset RA {self._latest_calibration.offset_ra_deg:.5f}°, "
                 f"Dec {self._latest_calibration.offset_dec_deg:.5f}°"
             )
+
+        self._update_shift_preview_checkbox(manual_invalidated)
+        if self._latest_frame is not None and prior_preview_state != self._preview_shift_state(manual_invalidated):
+            self._render_frame(self._latest_frame)
 
         self._update_action_buttons(telescope_connected=telescope_connected, camera_connected=camera_connected)
 

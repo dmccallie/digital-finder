@@ -7,6 +7,7 @@ from digital_finder.models import CalibrationStar
 SAMPLE_CALIBRATION_STARS: list[CalibrationStar] = [
     
     CalibrationStar(name="HD 46223", ra_deg=98.041667, dec_deg=5.005833, notes="Rosette central star test target"),
+    CalibrationStar(name="Mon 12", ra_deg=98.08, dec_deg=4.8558, notes="Rosette bright star test target"),
 
     CalibrationStar(name="Arcturus",    ra_deg=213.915300, dec_deg=19.182409,  notes="Spring, often east/south-east"),
     CalibrationStar(name="Pollux",      ra_deg=116.328958, dec_deg=28.026199,  notes="Spring, east/south-east"),

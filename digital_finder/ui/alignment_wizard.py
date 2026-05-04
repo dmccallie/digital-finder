@@ -7,6 +7,7 @@ from PySide6 import QtCore, QtGui, QtWidgets
 from digital_finder.config import TIMEOUTS
 from digital_finder.models import (
     CalibrationRecord,
+    CalibrationStar,
     Coordinates,
     Frame,
     SolveResult,
@@ -88,6 +89,7 @@ class AlignmentWizardDialog(QtWidgets.QDialog):
         self._observatory_latitude_deg = observatory_latitude_deg
         self._observatory_longitude_deg = observatory_longitude_deg
         self._calibration_record: CalibrationRecord | None = None
+        self._preview_solve_result: SolveResult | None = None
         self._solve_thread: QtCore.QThread | None = None
         self._solve_worker: _SolveWorker | None = None
         self._solve_in_progress = False
@@ -146,6 +148,10 @@ class AlignmentWizardDialog(QtWidgets.QDialog):
     @property
     def calibration_record(self) -> CalibrationRecord | None:
         return self._calibration_record
+
+    @property
+    def preview_solve_result(self) -> SolveResult | None:
+        return self._preview_solve_result
 
     def _selected_star(self):
         return self._star_combo.currentData()
@@ -263,7 +269,7 @@ class AlignmentWizardDialog(QtWidgets.QDialog):
         if self._solve_cancelled:
             return
         self._pending_retry = False
-        if not isinstance(solve, SolveResult) or not isinstance(mount, Coordinates):
+        if not isinstance(solve, SolveResult) or not isinstance(mount, Coordinates) or not isinstance(star, CalibrationStar):
             self._handle_solve_error("Invalid solve response")
             return
 
@@ -295,6 +301,7 @@ class AlignmentWizardDialog(QtWidgets.QDialog):
             solve_confidence=solve.confidence,
         )
         self._calibration_record = record
+        self._preview_solve_result = solve
         logger.info(
             "Calibration computed star=%s offset_ra=%.5f offset_dec=%.5f confidence=%s",
             record.star_name,
