@@ -70,6 +70,7 @@ PREVIEW_WCS_MAX_DEC_DRIFT_DEG = 5.0
 class PersistentSettings:
     telescope_selected: str | None = None
     telescope_history: list[str] | None = None
+    telescope_use_jnow_override: bool = False
     camera_selected: str = "zwo"
     zwo_camera_index: int = 0
     zwo_camera_name: str = ""
@@ -98,6 +99,7 @@ class PersistentSettings:
         return cls(
             telescope_selected=data.get("telescope_selected"),
             telescope_history=list(data.get("telescope_history", [])),
+            telescope_use_jnow_override=bool(data.get("telescope_use_jnow_override", False)),
             camera_selected=str(data.get("camera_selected", "zwo")),
             zwo_camera_index=max(0, int(data.get("zwo_camera_index", 0))),
             zwo_camera_name=str(data.get("zwo_camera_name", "")),
@@ -106,7 +108,7 @@ class PersistentSettings:
             camera_binning=int(data.get("camera_binning", 1)),
             camera_data_type=str(data.get("camera_data_type", CameraDataType.RAW16.value)),
             camera_looping=bool(data.get("camera_looping", True)),
-            app_epoch=str(data.get("app_epoch", DEFAULT_EPOCH)),
+            app_epoch=DEFAULT_EPOCH,
             astap_executable=str(data.get("astap_executable", SOLVER_CONFIG.astap_executable)),
             astap_downsize_factor=max(1, int(data.get("astap_downsize_factor", 1))),
             finder_focal_length_mm=max(0, int(data.get("finder_focal_length_mm", 0))),
@@ -125,6 +127,7 @@ class PersistentSettings:
         return {
             "telescope_selected": self.telescope_selected,
             "telescope_history": list(self.telescope_history or []),
+            "telescope_use_jnow_override": self.telescope_use_jnow_override,
             "camera_selected": self.camera_selected,
             "zwo_camera_index": self.zwo_camera_index,
             "zwo_camera_name": self.zwo_camera_name,
@@ -133,7 +136,7 @@ class PersistentSettings:
             "camera_binning": self.camera_binning,
             "camera_data_type": self.camera_data_type,
             "camera_looping": self.camera_looping,
-            "app_epoch": self.app_epoch,
+            "app_epoch": DEFAULT_EPOCH,
             "astap_executable": self.astap_executable,
             "astap_downsize_factor": self.astap_downsize_factor,
             "finder_focal_length_mm": self.finder_focal_length_mm,
@@ -186,6 +189,7 @@ class _TelescopeConnectWorker(QtCore.QObject):
         port: int,
         device: int,
         epoch: str,
+        telescope_use_jnow_override: bool,
         timeout_s: float,
     ) -> None:
         super().__init__()
@@ -194,6 +198,7 @@ class _TelescopeConnectWorker(QtCore.QObject):
         self._port = port
         self._device = device
         self._epoch = epoch
+        self._telescope_use_jnow_override = telescope_use_jnow_override
         self._timeout_s = timeout_s
 
     @QtCore.Slot()
@@ -204,6 +209,7 @@ class _TelescopeConnectWorker(QtCore.QObject):
                 port=self._port,
                 device_number=self._device,
                 epoch=self._epoch,
+                converse_with_telescope_in_jnow=self._telescope_use_jnow_override,
                 connect_timeout_s=self._timeout_s,
             )
             scope.connect(timeout_s=self._timeout_s)
@@ -631,10 +637,10 @@ class AppSettingsDialog(QtWidgets.QDialog):
         self.resize(560, 360)
         self._image_height_px = image_height_px
 
-        self._epoch = QtWidgets.QComboBox()
-        self._epoch.addItems(["J2000", "JNOW"])
-        idx = self._epoch.findText(settings.app_epoch)
-        self._epoch.setCurrentIndex(idx if idx >= 0 else 0)
+        self._coordinate_frame = QtWidgets.QLabel("Internal coordinate frame: J2000")
+        self._coordinate_frame.setToolTip(
+            "Digital Finder now keeps all internal coordinates in J2000. The telescope JNow override is on the main window."
+        )
 
         self._astap = QtWidgets.QLineEdit(settings.astap_executable)
         self._astap_downsize = QtWidgets.QSpinBox()
@@ -687,8 +693,8 @@ class AppSettingsDialog(QtWidgets.QDialog):
         cancel = QtWidgets.QPushButton("Cancel")
 
         grid = QtWidgets.QGridLayout(self)
-        grid.addWidget(QtWidgets.QLabel("Epoch"), 0, 0)
-        grid.addWidget(self._epoch, 0, 1)
+        grid.addWidget(QtWidgets.QLabel("Coordinate frame"), 0, 0)
+        grid.addWidget(self._coordinate_frame, 0, 1)
         grid.addWidget(QtWidgets.QLabel("ASTAP executable"), 1, 0)
         grid.addWidget(self._astap, 1, 1)
         grid.addWidget(QtWidgets.QLabel("ASTAP downsize factor"), 2, 0)
@@ -738,7 +744,7 @@ class AppSettingsDialog(QtWidgets.QDialog):
         self._fov_label.setText(f"{fov_deg:.3f} deg")
 
     def apply_to(self, settings: PersistentSettings) -> None:
-        settings.app_epoch = self._epoch.currentText()
+        settings.app_epoch = DEFAULT_EPOCH
         settings.astap_executable = self._astap.text().strip() or SOLVER_CONFIG.astap_executable
         settings.astap_downsize_factor = max(1, int(self._astap_downsize.value()))
         settings.finder_focal_length_mm = max(0, int(self._finder_focal_length.value()))
@@ -758,7 +764,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._settings_path = Path(user_data_dir(APP_NAME, APP_AUTHOR)) / "settings.json"
         print(f"Digital Finder Settings will be loaded from and saved to {self._settings_path}")
         self._settings = self._load_settings()
-        self._epoch = self._settings.app_epoch
+        self._epoch = DEFAULT_EPOCH
         self._apply_logging_level(self._settings.logging_level)
         self._apply_initial_window_size()
 
@@ -782,6 +788,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._telescope_connect_thread: QtCore.QThread | None = None
         self._telescope_connect_worker: _TelescopeConnectWorker | None = None
         self._telescope_connect_in_progress = False
+        self._pending_telescope_reconnect = False
         self._toast: _Toast | None = None
         self._pending_toast_message: str | None = None
         self._pending_fits_save_path: Path | None = None
@@ -829,6 +836,15 @@ class MainWindow(QtWidgets.QMainWindow):
         status_layout.addWidget(self._telescope_status)
         status_layout.addWidget(self._camera_status)
         status_layout.addWidget(self._calibration_status)
+        self._telescope_epoch_override_checkbox = QtWidgets.QCheckBox(
+            "Converse with telescope using JNow instead of J2000"
+        )
+        self._telescope_epoch_override_checkbox.setChecked(self._settings.telescope_use_jnow_override)
+        self._telescope_epoch_override_checkbox.setToolTip(
+            "Digital Finder keeps internal coordinates in J2000. Enable this only if the telescope controller expects JNow coordinates for reads, slews, and syncs."
+        )
+        self._telescope_epoch_override_checkbox.toggled.connect(self._on_telescope_epoch_override_toggled)
+        status_layout.addWidget(self._telescope_epoch_override_checkbox)
 
         left_panel = QtWidgets.QWidget()
         left_layout = QtWidgets.QVBoxLayout(left_panel)
@@ -1192,6 +1208,7 @@ class MainWindow(QtWidgets.QMainWindow):
             port=port,
             device=device,
             epoch=self._epoch,
+            telescope_use_jnow_override=self._settings.telescope_use_jnow_override,
             timeout_s=TIMEOUTS.telescope_connect_s,
         )
         self._telescope_connect_worker.moveToThread(self._telescope_connect_thread)
@@ -1207,6 +1224,10 @@ class MainWindow(QtWidgets.QMainWindow):
     @QtCore.Slot(object, str)
     def _on_telescope_connected(self, scope: object, endpoint_text: str) -> None:
         if self._settings.telescope_selected != endpoint_text:
+            return
+
+        if getattr(scope, "converse_with_telescope_in_jnow", self._settings.telescope_use_jnow_override) != self._settings.telescope_use_jnow_override:
+            self._pending_telescope_reconnect = True
             return
 
         self._telescope = scope  # type: ignore[assignment]
@@ -1229,6 +1250,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self._telescope_connect_in_progress = False
         self._telescope_connect_worker = None
         self._telescope_connect_thread = None
+        if self._pending_telescope_reconnect and self._settings.telescope_selected is not None:
+            self._pending_telescope_reconnect = False
+            self._attempt_telescope_connect()
+            return
 
     def _mount_provider(self) -> Coordinates:
         if self._telescope is not None:
@@ -1421,11 +1446,29 @@ class MainWindow(QtWidgets.QMainWindow):
 
         dialog.apply_to(self._settings)
         self._apply_logging_level(self._settings.logging_level)
-        self._epoch = self._settings.app_epoch
+        self._epoch = DEFAULT_EPOCH
         self._rebuild_solver_backend(clear_preview_wcs=True)
         self._apply_retry_interval()
         self._save_settings()
         self._sync_live_loop_timer()
+        self._refresh_status_lines()
+
+    @QtCore.Slot(bool)
+    def _on_telescope_epoch_override_toggled(self, checked: bool) -> None:
+        if checked == self._settings.telescope_use_jnow_override:
+            return
+
+        self._settings.telescope_use_jnow_override = checked
+        self._telescope_last_error = None
+        self._pending_telescope_reconnect = self._telescope_connect_in_progress
+        self._save_settings()
+        self._disconnect_telescope()
+        if self._settings.telescope_selected is not None and not self._telescope_connect_in_progress:
+            self._attempt_telescope_connect()
+            self._telescope_retry_timer.start()
+
+        mode_text = "JNow" if checked else "J2000"
+        self._show_toast(f"Telescope conversation mode set to {mode_text}")
         self._refresh_status_lines()
 
     def _apply_logging_level(self, level_name: str) -> None:
@@ -1802,12 +1845,20 @@ class MainWindow(QtWidgets.QMainWindow):
         if self._telescope is None or self._solver is None:
             QtWidgets.QMessageBox.warning(self, "Unavailable", "Telescope and plate solver must be connected first.")
             return
-        if self._latest_calibration is None:
-            QtWidgets.QMessageBox.warning(self, "No Finder Calibration", "Run Calibrate Finder first.")
-            return
-        if self._store.is_manual_invalidated():
-            QtWidgets.QMessageBox.warning(self, "Calibration Invalid", "Finder calibration was manually invalidated.")
-            return
+
+        calibration_available = self._latest_calibration is not None and self._store.is_manual_invalidated() is False
+        if not calibration_available:
+            proceed_without_offset = QtWidgets.QMessageBox.warning(
+                self,
+                "Proceed Without Finder Offset",
+                f"Finder calibration is unavailable, so {MAIN_SCOPE_NAME} will be aligned using the plate-solved finder coordinates without any finder-to-main offset correction.\n\n"
+                "This should still be reasonably close if the finder is physically well aligned, but it may not land exactly where you expect.\n\n"
+                "Continue anyway?",
+                QtWidgets.QMessageBox.StandardButton.Ok | QtWidgets.QMessageBox.StandardButton.Cancel,
+                QtWidgets.QMessageBox.StandardButton.Cancel,
+            )
+            if proceed_without_offset != QtWidgets.QMessageBox.StandardButton.Ok:
+                return
 
         proceed = QtWidgets.QMessageBox.question(
             self,
@@ -1856,8 +1907,10 @@ class MainWindow(QtWidgets.QMainWindow):
             return
 
         solved = solve.coordinates
-        target_ra = wrap_ra_deg(solved.ra_deg + self._latest_calibration.offset_ra_deg)
-        target_dec = clamp_dec_deg(solved.dec_deg + self._latest_calibration.offset_dec_deg)
+        offset_ra_deg = self._latest_calibration.offset_ra_deg if calibration_available and self._latest_calibration is not None else 0.0
+        offset_dec_deg = self._latest_calibration.offset_dec_deg if calibration_available and self._latest_calibration is not None else 0.0
+        target_ra = wrap_ra_deg(solved.ra_deg + offset_ra_deg)
+        target_dec = clamp_dec_deg(solved.dec_deg + offset_dec_deg)
         target = Coordinates(ra_deg=target_ra, dec_deg=target_dec, epoch=self._epoch)
 
         metrics_text = format_plate_solve_metrics(solve.metrics)
@@ -1872,6 +1925,11 @@ class MainWindow(QtWidgets.QMainWindow):
             f"Dec {format_dec_deg_with_dms(target.dec_deg, precision=6)}\n"
             f"{self._format_altaz_text(target.ra_deg, target.dec_deg, precision=3)}"
         )
+        if not calibration_available:
+            review_text = (
+                f"{review_text}\n\n"
+                "Warning: no finder calibration offset is available, so the sync target matches the finder plate solve directly."
+            )
         if metrics_text:
             review_text = f"{review_text}\n\n{metrics_text}"
 
@@ -1900,9 +1958,9 @@ class MainWindow(QtWidgets.QMainWindow):
             solved.dec_deg,
             target.ra_deg,
             target.dec_deg,
-            self._latest_calibration.star_name,
-            self._latest_calibration.offset_ra_deg,
-            self._latest_calibration.offset_dec_deg,
+            self._latest_calibration.star_name if calibration_available and self._latest_calibration is not None else "<none>",
+            offset_ra_deg,
+            offset_dec_deg,
         )
 
         QtWidgets.QMessageBox.information(
@@ -1916,22 +1974,23 @@ class MainWindow(QtWidgets.QMainWindow):
         self._refresh_status_lines()
 
     def _update_action_buttons(self, telescope_connected: bool, camera_connected: bool) -> None:
-        calibration_ready = self._latest_calibration is not None and self._store.is_manual_invalidated() is False
-
         align_reasons: list[str] = []
         if not telescope_connected:
             align_reasons.append("telescope is not connected")
         if not camera_connected:
             align_reasons.append("camera is not connected")
-        if not calibration_ready:
-            align_reasons.append("finder calibration is missing or invalid")
 
         if align_reasons:
             self._align_telescope_btn.setEnabled(False)
             self._align_telescope_btn.setToolTip(f"Align is unavailable: {', '.join(align_reasons)}.")
         else:
             self._align_telescope_btn.setEnabled(True)
-            self._align_telescope_btn.setToolTip(f"Capture, solve, and align {MAIN_SCOPE_NAME}.")
+            if self._latest_calibration is not None and self._store.is_manual_invalidated() is False:
+                self._align_telescope_btn.setToolTip(f"Capture, solve, and align {MAIN_SCOPE_NAME}.")
+            else:
+                self._align_telescope_btn.setToolTip(
+                    f"Capture, solve, and align {MAIN_SCOPE_NAME} without a finder offset correction."
+                )
 
         calibrate_reasons: list[str] = []
         if not telescope_connected:
@@ -2059,7 +2118,8 @@ class MainWindow(QtWidgets.QMainWindow):
                         f"Telescope: {self._selected_telescope_name()} | "
                         f"RA {format_ra_deg_with_hms(coords.ra_deg, precision=5)} | "
                         f"Dec {format_dec_deg_with_dms(coords.dec_deg, precision=5)} | "
-                        f"{self._format_altaz_text(coords.ra_deg, coords.dec_deg, precision=2)}"
+                        f"{self._format_altaz_text(coords.ra_deg, coords.dec_deg, precision=2)} | "
+                        f"talking {('JNow' if self._settings.telescope_use_jnow_override else 'J2000')}"
                         f"{slew_text}"
                     )
             except Exception as exc:  # noqa: BLE001

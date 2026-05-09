@@ -7,7 +7,8 @@ from dataclasses import dataclass
 from alpaca import discovery, management
 from alpaca.telescope import Telescope
 
-from digital_finder.models import Coordinates
+from digital_finder.config import DEFAULT_EPOCH
+from digital_finder.models import Coordinates, convert_coordinates_epoch, normalize_epoch_name
 from digital_finder.services.interfaces import TelescopeClient
 
 logger = logging.getLogger(__name__)
@@ -96,15 +97,27 @@ class AlpacaTelescopeClient(TelescopeClient):
         host: str,
         port: int,
         device_number: int = 0,
-        epoch: str = "J2000",
+        epoch: str = DEFAULT_EPOCH,
+        converse_with_telescope_in_jnow: bool = False,
         connect_timeout_s: float = 5.0,
     ) -> None:
         self.host = host
         self.port = port
         self.device_number = device_number
-        self.epoch = epoch
+        self.epoch = normalize_epoch_name(epoch)
+        self._telescope_epoch = "JNOW" if converse_with_telescope_in_jnow else self.epoch
         self._connect_timeout_s = max(0.5, float(connect_timeout_s))
         self._scope = Telescope(f"{self.host}:{self.port}", self.device_number)
+
+    @property
+    def converse_with_telescope_in_jnow(self) -> bool:
+        return self._telescope_epoch == "JNOW"
+
+    def _to_telescope_epoch(self, coordinates: Coordinates) -> Coordinates:
+        return convert_coordinates_epoch(coordinates.normalized(), self._telescope_epoch)
+
+    def _from_telescope_epoch(self, coordinates: Coordinates) -> Coordinates:
+        return convert_coordinates_epoch(coordinates.normalized(), self.epoch)
 
     def _deadline(self, timeout_s: float) -> float:
         return time.monotonic() + max(0.1, timeout_s)
@@ -161,7 +174,8 @@ class AlpacaTelescopeClient(TelescopeClient):
             self._scope.Tracking = True
         except Exception as exc:  # noqa: BLE001
             logger.warning("Unable to set Tracking=True before slew: %s", exc)
-        self._scope.SlewToCoordinatesAsync(_to_ra_hours(target.ra_deg), target.dec_deg)
+        telescope_target = self._to_telescope_epoch(target)
+        self._scope.SlewToCoordinatesAsync(_to_ra_hours(telescope_target.ra_deg), telescope_target.dec_deg)
 
         # Confirm the async operation is healthy by touching Slewing once quickly.
         _ = self._scope.Slewing
@@ -185,7 +199,12 @@ class AlpacaTelescopeClient(TelescopeClient):
             try:
                 ra_hours = float(self._scope.RightAscension)
                 dec_deg = float(self._scope.Declination)
-                return Coordinates(ra_deg=_to_ra_degrees(ra_hours), dec_deg=dec_deg, epoch=self.epoch).normalized()
+                telescope_coordinates = Coordinates(
+                    ra_deg=_to_ra_degrees(ra_hours),
+                    dec_deg=dec_deg,
+                    epoch=self._telescope_epoch,
+                ).normalized()
+                return self._from_telescope_epoch(telescope_coordinates)
             except Exception:
                 if time.monotonic() >= deadline:
                     raise TimeoutError("Timed out reading Alpaca coordinates")
@@ -193,7 +212,8 @@ class AlpacaTelescopeClient(TelescopeClient):
 
     def sync_to_coordinates(self, target: Coordinates, timeout_s: float) -> None:
         self._connect_if_needed(timeout_s=timeout_s)
-        self._scope.SyncToCoordinates(_to_ra_hours(target.ra_deg), target.dec_deg)
+        telescope_target = self._to_telescope_epoch(target)
+        self._scope.SyncToCoordinates(_to_ra_hours(telescope_target.ra_deg), telescope_target.dec_deg)
 
         # Ensure any previous async movement has settled after sync.
         self._wait_until_not_slewing(timeout_s=max(2.0, timeout_s))

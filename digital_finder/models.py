@@ -6,6 +6,9 @@ from datetime import datetime, timezone
 from typing import Any
 
 import numpy as np
+import astropy.units as u
+from astropy.coordinates import FK5, SkyCoord
+from astropy.time import Time as AstropyTime
 from astronomy import Horizon, Observer, Refraction, Time
 import logging
 
@@ -83,6 +86,63 @@ class Coordinates:
 
     def normalized(self) -> "Coordinates":
         return Coordinates(ra_deg=wrap_ra_deg(self.ra_deg), dec_deg=clamp_dec_deg(self.dec_deg), epoch=self.epoch)
+
+
+def normalize_epoch_name(epoch: str | None) -> str:
+    token = str(epoch or "").strip().upper()
+    if token in {"JNOW", "NOW"}:
+        return "JNOW"
+    return "J2000"
+
+
+def _coerce_astropy_time(value: datetime | str | AstropyTime | None) -> AstropyTime | None:
+    if value is None:
+        return None
+    if isinstance(value, AstropyTime):
+        return value
+    if isinstance(value, datetime):
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=timezone.utc)
+        return AstropyTime(value)
+    return AstropyTime(value)
+
+
+def _equinox_for_epoch(epoch: str, observation_time: AstropyTime) -> AstropyTime:
+    if normalize_epoch_name(epoch) == "JNOW":
+        return observation_time
+    return AstropyTime("J2000")
+
+
+def convert_coordinates_epoch(
+    coordinates: Coordinates,
+    target_epoch: str,
+    *,
+    observation_time: datetime | str | AstropyTime | None = None,
+) -> Coordinates:
+    source_epoch = normalize_epoch_name(coordinates.epoch)
+    normalized_target_epoch = normalize_epoch_name(target_epoch)
+    normalized = Coordinates(
+        ra_deg=coordinates.ra_deg,
+        dec_deg=coordinates.dec_deg,
+        epoch=source_epoch,
+    ).normalized()
+    if source_epoch == normalized_target_epoch:
+        return Coordinates(
+            ra_deg=normalized.ra_deg,
+            dec_deg=normalized.dec_deg,
+            epoch=normalized_target_epoch,
+        )
+
+    transform_time = _coerce_astropy_time(observation_time) or AstropyTime.now()
+    source_frame = FK5(equinox=_equinox_for_epoch(source_epoch, transform_time))
+    target_frame = FK5(equinox=_equinox_for_epoch(normalized_target_epoch, transform_time))
+    skycoord = SkyCoord(ra=normalized.ra_deg * u.deg, dec=normalized.dec_deg * u.deg, frame=source_frame)
+    transformed = skycoord.transform_to(target_frame)
+    return Coordinates(
+        ra_deg=float(transformed.ra.deg),
+        dec_deg=float(transformed.dec.deg),
+        epoch=normalized_target_epoch,
+    ).normalized()
 
 
 @dataclass
